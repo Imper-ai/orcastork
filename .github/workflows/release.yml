@@ -1,0 +1,79 @@
+name: Release
+
+# Publishing is deliberately manual: it runs when a GitHub Release is published, not on
+# every push to a tag, so cutting a release is an explicit act with a changelog attached.
+#
+# `workflow_dispatch` exists to rehearse the build half on demand — it can never publish
+# (see the `if` on the publish job), because a PyPI upload cannot be undone and a version
+# number cannot be reused.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+env:
+  POETRY_VERSION: "2.3.3"
+
+jobs:
+  build:
+    name: Build and check distributions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install Poetry
+        run: pipx install poetry==${{ env.POETRY_VERSION }}
+
+      # A release tagged v1.2.3 must carry version 1.2.3. Catching the mismatch here beats
+      # discovering it as a published version nobody can overwrite — PyPI never lets a version
+      # number be reused, even after a yank. Skipped on a manual run, which has no tag.
+      - name: The tag and the package version agree
+        if: github.event_name == 'release'
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          version="$(poetry version --short)"
+          if [ "$tag" != "$version" ]; then
+            echo "::error::release tag '${GITHUB_REF_NAME}' does not match pyproject version '${version}'"
+            exit 1
+          fi
+          echo "Releasing version ${version}"
+
+      - name: Build sdist and wheel
+        run: poetry build
+
+      - name: Check the built metadata
+        run: |
+          pipx install twine
+          twine check --strict dist/*
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    name: Publish to PyPI
+    needs: build
+    # A manual run stops after build. Uploading is reserved for a published release.
+    if: github.event_name == 'release'
+    runs-on: ubuntu-latest
+    # Gate the upload on a GitHub environment so the repository can require a reviewer before
+    # anything leaves for PyPI, and so the trusted-publisher claim can be scoped to it.
+    environment:
+      name: pypi
+      url: https://pypi.org/p/orcastork
+    permissions:
+      # The OIDC token PyPI exchanges for a short-lived upload token. This is the whole point of
+      # trusted publishing: no API token is stored in this repository at all.
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - uses: pypa/gh-action-pypi-publish@release/v1

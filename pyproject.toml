@@ -1,0 +1,108 @@
+[project]
+name = "orcastork"
+version = "0.1.0"
+description = "A dataflow orchestration framework: resumable, session-scoped graphs scheduled by data readiness."
+readme = "README.md"
+license = "GPL-3.0-or-later"
+authors = [{ name = "Imper.AI", email = "contact@imper.ai" }]
+keywords = ["orchestration", "dataflow", "blackboard", "workflow", "asyncio", "ports-and-adapters"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3.13",
+    "Framework :: AsyncIO",
+    "Topic :: Software Development :: Libraries :: Application Frameworks",
+    "Typing :: Typed",
+]
+requires-python = ">=3.13,<4.0"
+dependencies = [
+    "pydantic>=2.9.2,<3.0.0",
+    "loguru>=0.7.3,<0.8.0",
+    "orjson (>=3.11.9,<4.0.0)",
+    # The API only — it no-ops without an SDK, so depending on it costs a no-instrumentation
+    # deployment nothing; deployments that want the data wire opentelemetry-sdk themselves.
+    # Floor 1.42: the framework uses the keyword-argument Logger.emit(), absent from older
+    # 1.x API releases.
+    "opentelemetry-api (>=1.42.0,<2.0.0)",
+]
+
+[project.optional-dependencies]
+redis = ["redis>=5.2.1,<6.0.0"]
+# Capped <4.14.0: PyMongo 4.14 drops MongoDB 4.0 server support, tightens BinaryVector
+# encoding validation, and changes pymongo.uri_parser.parse_uri's return type to a plain dict.
+mongo = ["pymongo>=4.6.2,<4.14.0"]
+
+[project.scripts]
+orcastork-graph = 'orcastork.tools.graph:main'
+
+[tool.poetry.group.dev.dependencies]
+pytest = ">=8.3.4,<9.0.0"
+pytest-asyncio = ">=1.0.0,<2.0.0"
+mypy = ">=1.9.0,<2.0.0"
+ruff = ">=0.11.5,<1.0.0"
+freezegun = ">=1.5.1,<2.0.0"
+fakeredis = { extras = ["json", "lua"], version = ">=2.27.0,<3.0.0" }
+mongomock-motor = ">=0.0.34,<1.0.0"
+pytest-mock-resources = { extras = ["mongo", "docker", "redis"], version = ">=2.12.4,<3.0.0" }
+pytest-cov = ">=5.0.0,<8.0.0"
+# Tests assert telemetry through the SDK's in-memory exporters; production wires its own SDK.
+opentelemetry-sdk = ">=1.42.0,<2.0.0"
+
+[project.urls]
+Homepage = "https://github.com/Imper-ai/orcastork"
+Repository = "https://github.com/Imper-ai/orcastork"
+Issues = "https://github.com/Imper-ai/orcastork/issues"
+Changelog = "https://github.com/Imper-ai/orcastork/blob/main/CHANGELOG.md"
+
+[build-system]
+requires = ["poetry-core>=2.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+markers = [
+    "integration: needs Docker (a real MongoDB server), or is slow enough to keep out of the default run",
+]
+# Integration tests are opt-in: `pytest -m integration`.
+addopts = '-m "not integration"'
+
+[tool.ruff]
+line-length = 119
+indent-width = 4
+target-version = "py313"
+
+[tool.ruff.lint]
+select = [
+    "F",   # Pyflakes
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "I",   # isort
+    "N",   # pep8-naming
+    "B",   # flake8-bugbear
+    "A",   # flake8-builtins
+    "LOG", # flake8-logging
+    "RET", # flake8-return
+    "SIM", # flake8-simplify
+    "ARG", # flake8-unused-arguments
+]
+ignore = [
+    "RET504", # assignment-before-return reads better than inlining a long expression
+    "RET505", # an explicit `else` after `return` often mirrors the branch it pairs with
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["orcastork"]
+
+[tool.ruff.format]
+quote-style = "single"
+indent-style = "space"
+line-ending = "auto"
+
+[tool.mypy]
+python_version = "3.13"
+plugins = ["pydantic.mypy"]
+ignore_missing_imports = false
+strict_optional = true
+disallow_untyped_defs = true
+warn_redundant_casts = true
+exclude = ['^\.venv/']

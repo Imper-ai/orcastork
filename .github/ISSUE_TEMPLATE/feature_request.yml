@@ -1,0 +1,30 @@
+name: Feature request
+description: Suggest a capability the framework does not have
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: |
+        What are you trying to build, and where does the framework get in the way? Describe the
+        situation rather than the API you have in mind — there may be a way to do it today.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you would like instead
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: What you tried or considered
+      description: |
+        Including why the existing seams don't cover it — a custom adapter behind an existing
+        port, an operator policy, a `Capability`, or your own `CompletionCondition`.
+    validations:
+      required: false
