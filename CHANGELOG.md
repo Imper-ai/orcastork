@@ -9,9 +9,21 @@ under **Changed** with the migration.
 
 ## [Unreleased]
 
+## [0.1.1]
+
+First installable release.
+
+### Fixed
+
+- Nothing in the library changed from `0.1.0`. That version was published to PyPI and then
+  deleted, which permanently retires its filenames — PyPI refuses to serve or accept
+  `orcastork-0.1.0-*` ever again, so the version is unusable rather than merely absent. This
+  release is the same code under a version number that can actually be installed.
+
 ## [0.1.0]
 
-First public release.
+Withdrawn — published to PyPI and deleted, which burns the version permanently. Use `0.1.1`.
+Its contents were:
 
 ### Added
 
@@ -47,5 +59,6 @@ First public release.
   deployment wires an SDK, plus a loguru-to-OTel log bridge.
 - **Injected `Clock`** throughout, which is what makes the test suite deterministic and fast.
 
-[Unreleased]: https://github.com/Imper-ai/orcastork/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/Imper-ai/orcastork/releases/tag/v0.1.0
+[Unreleased]: https://github.com/Imper-ai/orcastork/compare/0.1.1...HEAD
+[0.1.1]: https://github.com/Imper-ai/orcastork/releases/tag/0.1.1
+[0.1.0]: https://github.com/Imper-ai/orcastork/releases/tag/0.1.0
