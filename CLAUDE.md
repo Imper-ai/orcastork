@@ -96,6 +96,22 @@ session-scoped `Orchestrator` (supervised by a `SessionOrchestrationManager`) sc
 - **Manager API is flow-based** — `start_session`/`resume`/`deliver` take a `FlowDefinition`
   (`flow.py`); its fingerprint backs resume drift detection.
 
+## `orcastork_lite/` — the scheduling-only sibling
+
+A second, independent package in the same distribution (`pyproject.toml` `[tool.poetry].packages`).
+It keeps the scheduler (readiness, debounced reruns, `rerun_on`, `uses`, `consumes` pruning, retry
+backoff, timeouts, `max_cycles`) and the dependency injection (capabilities, `CapabilityCatalog`
+with per-namespace operator/capability gating, `Runtime(clock, catalog)`) and **nothing else**: no
+store port, epochs, locks, inbox, parking, aggregators, durable store, audit, archive, telemetry or
+`ctx.once`. Session state is an in-memory `SessionState`; `Orchestrator.run()` returns the final
+DataPoints. Rules that carry over unchanged: injected `Clock` only, loop-scheduled windows (never an
+in-task sleep), sole-writer loop, fault isolation per operator, house style, `tests/test_harness.py`.
+Rules that do not: there are no registries (classes are handed to the orchestrator; duplicates raise
+there) and DataPoints have no `type` Literal or `config` — the class is the type. Do not import
+`orcastork` from it or vice versa, and do not let the removed features creep back in: the point of
+the package is what it lacks. `orcastork_lite/tools/` (the `orcastork-lite-graph` CLI) is the one
+subpackage the library must never import; a test enforces it.
+
 ## Build & test
 
 - `make lint` — `poetry check` + ruff + ruff format --check + mypy.
