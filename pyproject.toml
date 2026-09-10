@@ -34,6 +34,11 @@ mongo = ["pymongo>=4.6.2,<4.14.0"]
 
 [project.scripts]
 orcastork-graph = 'orcastork.tools.graph:main'
+orcastork-lite-graph = 'orcastork_lite.tools.graph:main'
+
+[tool.poetry]
+# Two packages ship in one distribution: the full framework and its scheduling-only sibling.
+packages = [{ include = "orcastork" }, { include = "orcastork_lite" }]
 
 [tool.poetry.group.dev.dependencies]
 pytest = ">=8.3.4,<9.0.0"
