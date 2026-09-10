@@ -28,6 +28,7 @@ from .exceptions import (
     InvalidOperatorError,
     OrcastorkLiteError,
     UnboundedCycleError,
+    UnhashableValueError,
 )
 from .ids import CapabilityId, NamespaceId, OperatorId, SessionId
 from .operators import InvocationDelta, Operator, OperatorContext, OperatorPolicy, RerunOn, RetryPolicy
@@ -65,6 +66,7 @@ __all__ = [
     'SessionResult',
     'SystemClock',
     'UnboundedCycleError',
+    'UnhashableValueError',
     'build_runtime',
     'compute_available',
     'identity_key',

@@ -19,3 +19,7 @@ class UnboundedCycleError(OrcastorkLiteError):
 
 class CapabilityUnavailableError(OrcastorkLiteError):
     """``require`` was called for a capability type with no available provider."""
+
+
+class UnhashableValueError(OrcastorkLiteError):
+    """A DataPoint value could not be reduced to a hashable identity (see ``datapoints._make_hashable``)."""

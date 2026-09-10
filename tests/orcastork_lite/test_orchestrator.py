@@ -9,6 +9,7 @@ import pytest
 from loguru import logger
 
 from orcastork_lite import (
+    DataPoint,
     DuplicateIdError,
     InMemoryCapabilityCatalog,
     InvalidOperatorError,
@@ -295,3 +296,16 @@ async def test_undeclared_emission_is_merged_and_logged_once(fake_clock: FakeClo
 
     assert _values(result.data_points, Ip) == ['1', '2']
     assert len([record for record in records if 'produces declaration' in record]) == 1
+
+
+async def test_unhashable_emission_fails_only_its_operator(fake_clock: FakeClock) -> None:
+    class Raw(DataPoint[Any]): ...
+
+    careless = make_operator('careless', depends_on={Flag}, produces={Raw}, emits=[Raw.emit(bytearray(b'x'))])
+    peer = make_operator('peer', depends_on={Flag}, produces={Ip}, emits=[Ip.emit('1')])
+
+    result = await run_session(fake_clock, [careless, peer], seed=[dp(Flag, True, fake_clock.now())])
+
+    assert 'bytearray' in result.failures[OperatorId('careless')]
+    assert result.operator_runs == {'careless': 1, 'peer': 1}
+    assert _values(result.data_points, Ip) == ['1']

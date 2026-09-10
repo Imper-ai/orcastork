@@ -5,7 +5,10 @@ from __future__ import annotations
 from datetime import timedelta
 from typing import Any
 
-from orcastork_lite import DataPoint, DataPointView, OperatorId
+import pytest
+from pydantic import BaseModel
+
+from orcastork_lite import DataPoint, DataPointView, OperatorId, UnhashableValueError
 
 from ..doubles.clock import FakeClock
 from .conftest import Email, Ip, PersonalEmail, Risk, WorkEmail, dp
@@ -60,3 +63,34 @@ def test_reobserved_only_advances_last_retrieved(fake_clock: FakeClock) -> None:
     later = point.reobserved(now + timedelta(seconds=30))
     assert (later.first_retrieved, later.last_retrieved) == (now, now + timedelta(seconds=30))
     assert point.reobserved(now - timedelta(seconds=30)).last_retrieved == now  # never moves backwards
+
+
+def test_identity_is_computed_once_and_survives_reobservation(fake_clock: FakeClock) -> None:
+    now = fake_clock.now()
+    point = dp(Ip, '1.1.1.1', now)
+    assert point.identity is point.identity  # cached, not recomputed per hash/eq
+    assert point.reobserved(now + timedelta(seconds=1)).identity == point.identity == (Ip, '1.1.1.1')
+
+
+def test_heterogeneous_sets_and_pydantic_model_values_get_a_stable_identity(fake_clock: FakeClock) -> None:
+    class Tags(DataPoint[set[Any]]): ...
+
+    class Shape(BaseModel):
+        name: str
+        sides: list[int]
+
+    class Shaped(DataPoint[Shape]): ...
+
+    now = fake_clock.now()
+    assert dp(Tags, {1, 'a', (2, 3)}, now) == dp(Tags, {(2, 3), 'a', 1}, now)
+    assert dp(Shaped, Shape(name='tri', sides=[1, 2, 3]), now) == dp(Shaped, Shape(name='tri', sides=[1, 2, 3]), now)
+    assert dp(Shaped, Shape(name='tri', sides=[1, 2, 3]), now) != dp(Shaped, Shape(name='sq', sides=[1, 2, 3]), now)
+
+
+def test_unhashable_value_is_rejected_at_construction(fake_clock: FakeClock) -> None:
+    class Raw(DataPoint[Any]): ...
+
+    with pytest.raises(UnhashableValueError, match='bytearray'):
+        dp(Raw, bytearray(b'x'), fake_clock.now())
+    with pytest.raises(UnhashableValueError):
+        Raw.emit({'nested': [bytearray(b'x')]}).finalize(retrieved_by=OperatorId('op'), at=fake_clock.now())
