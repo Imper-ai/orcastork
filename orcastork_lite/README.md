@@ -117,8 +117,8 @@ pruned before the session starts.
 ### Following a session while it runs
 
 Session state is private to the orchestrator, so the loop publishes every change to the runtime's
-`SessionEventSink`: a `DataPointsMerged` per merge batch (every DataPoint added or freshened in one
-pass, with value, provenance and the session revision), an `OperatorRunCompleted` per finished run (`succeeded`, `failed`,
+`SessionEventSink`: a `DataPointMerged` per DataPoint added or freshened (with its value, provenance
+and the session revision), an `OperatorRunCompleted` per finished run (`succeeded`, `failed`,
 `retrying`, `cancelled`), a `CapabilityActivated` per activation outcome, and one `SessionCompleted`.
 The default sink drops them. `orcastork_lite.adapters.memory.InMemorySessionEventSink` keeps them in a
 list; `orcastork_lite.adapters.redis.RedisSessionEventSink` appends each to a Redis stream per session

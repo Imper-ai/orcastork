@@ -24,8 +24,7 @@ from .clock import Clock, SystemClock
 from .datapoints import DataPoint, DataPointEmission, DataPointView, identity_key
 from .events import (
     CapabilityActivated,
-    DataPointsMerged,
-    MergedDataPoint,
+    DataPointMerged,
     NullSessionEventSink,
     OperatorRunCompleted,
     SessionCompleted,
@@ -57,8 +56,7 @@ __all__ = [
     'SessionCompleted',
     'OperatorRunCompleted',
     'NullSessionEventSink',
-    'DataPointsMerged',
-    'MergedDataPoint',
+    'DataPointMerged',
     'CapabilityActivated',
     'DEFAULT_OPERATION_TIMEOUT',
     'DEFAULT_PUBLISH_TIMEOUT',

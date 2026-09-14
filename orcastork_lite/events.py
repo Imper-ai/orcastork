@@ -1,8 +1,8 @@
 """Session events — the live view of a running session, and the port they are published through.
 
 ``SessionState`` is private to the orchestrator, so without this nothing outside the process could
-see a DataPoint before ``run()`` returned. The loop publishes one event per change — a batch of
-DataPoints merged, an operator run finished, a capability activated, the session completed — through the
+see a DataPoint before ``run()`` returned. The loop publishes one event per change — a DataPoint
+merged, an operator run finished, a capability activated, the session completed — through the
 injected :class:`SessionEventSink`. The shipped sinks are a no-op (the default), an in-memory list
 (tests) and a Redis stream (``adapters/redis.py``). A sink that raises is logged and the event is
 dropped: the live view is a convenience, never a reason to wedge the session.
@@ -26,30 +26,20 @@ class _SessionEventBase(BaseModel):
     at: datetime  # the session clock's ``now()`` when the change happened
 
 
-class MergedDataPoint(BaseModel):
-    """One DataPoint as it stands in the session after a merge.
+class DataPointMerged(_SessionEventBase):
+    """A DataPoint landed in the session: a new identity (``added``) or a fresher sighting (``updated``).
 
-    ``retrieved_by`` is the stored DataPoint's provenance — its first observer. An ``updated`` merge only
-    advances ``last_retrieved``; the operator that re-observed the value is not recorded on the identity.
+    One event per DataPoint on purpose: a stream entry is the unit a consumer filters and acts on, so
+    "react the moment this DataPoint lands" needs no unpacking of a batch. ``retrieved_by`` is the stored
+    DataPoint's provenance — its first observer. An ``updated`` merge only advances ``last_retrieved``; the
+    operator that re-observed the value is not recorded on the identity.
     """
 
-    model_config = ConfigDict(frozen=True)
-
+    kind: Literal['data_point_merged'] = 'data_point_merged'
     data_point_type: str  # the DataPoint class name
     value: Any
     retrieved_by: OperatorId
-
-
-class DataPointsMerged(_SessionEventBase):
-    """One merge landed in the session: new identities (``added``) and fresher sightings (``updated``).
-
-    A merge is one batch — the seed, or every emission drained from the queue in one pass — so a burst
-    of DataPoints costs the sink one event (one round trip) rather than one per DataPoint.
-    """
-
-    kind: Literal['data_points_merged'] = 'data_points_merged'
-    added: tuple[MergedDataPoint, ...]
-    updated: tuple[MergedDataPoint, ...]
+    merge: Literal['added', 'updated']
     revision: int  # the session revision the merge produced
 
 
@@ -80,7 +70,7 @@ class SessionCompleted(_SessionEventBase):
     failures: dict[OperatorId, str]
 
 
-SessionEvent = DataPointsMerged | OperatorRunCompleted | CapabilityActivated | SessionCompleted
+SessionEvent = DataPointMerged | OperatorRunCompleted | CapabilityActivated | SessionCompleted
 
 
 @runtime_checkable

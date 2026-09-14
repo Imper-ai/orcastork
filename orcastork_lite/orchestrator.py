@@ -32,14 +32,7 @@ from pydantic import BaseModel, ConfigDict
 
 from .capabilities import Capability, CapabilityActivator, CapabilityView
 from .datapoints import DataPoint, DataPointView
-from .events import (
-    CapabilityActivated,
-    DataPointsMerged,
-    MergedDataPoint,
-    OperatorRunCompleted,
-    SessionCompleted,
-    SessionEvent,
-)
+from .events import CapabilityActivated, DataPointMerged, OperatorRunCompleted, SessionCompleted, SessionEvent
 from .exceptions import DuplicateIdError
 from .graph import backward_reachable, build_edges, cycle_caps, validate_acyclic_or_bounded
 from .ids import CapabilityId, NamespaceId, OperatorId, SessionId
@@ -485,22 +478,18 @@ class Orchestrator:
         await self._publish_merge(self._state.merge(emission.data_point for emission in emitted))
 
     async def _publish_merge(self, outcome: MergeOutcome) -> None:
-        if not outcome.changed:
-            return
-
-        def describe(data_point: DataPoint[Any]) -> MergedDataPoint:
-            return MergedDataPoint(
-                data_point_type=type(data_point).__name__, value=data_point.value, retrieved_by=data_point.retrieved_by
-            )
-
-        await self._publish(
-            DataPointsMerged(
-                **self._event_base(),
-                added=tuple(describe(data_point) for data_point in outcome.added),
-                updated=tuple(describe(data_point) for data_point in outcome.updated),
-                revision=outcome.revision,
-            )
-        )
+        for merge, data_points in (('added', outcome.added), ('updated', outcome.updated)):
+            for data_point in data_points:
+                await self._publish(
+                    DataPointMerged(
+                        **self._event_base(),
+                        data_point_type=type(data_point).__name__,
+                        value=data_point.value,
+                        retrieved_by=data_point.retrieved_by,
+                        merge=merge,
+                        revision=outcome.revision,
+                    )
+                )
 
     async def _record_completion(
         self, signal: _Completed, retries: DebounceController, running: dict[OperatorId, _Running]

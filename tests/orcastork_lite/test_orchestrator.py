@@ -12,7 +12,7 @@ from loguru import logger
 from orcastork_lite import (
     CapabilityActivated,
     DataPoint,
-    DataPointsMerged,
+    DataPointMerged,
     DuplicateIdError,
     InMemoryCapabilityCatalog,
     InvalidOperatorError,
@@ -419,22 +419,19 @@ async def test_every_change_is_published_to_the_event_sink_in_order(fake_clock: 
     ).run()
 
     kinds = [event.kind for event in events.events]
-    assert kinds[0] == 'data_points_merged'  # the seed, one event for both DataPoints, before anything runs
-    assert kinds[1] == 'capability_activated'
+    assert kinds[:2] == ['data_point_merged', 'data_point_merged']  # the seed, before anything runs
+    assert kinds[2] == 'capability_activated'
     assert kinds[-1] == 'session_completed'
     assert all(event.session_id == SESSION and event.namespace_id == NAMESPACE for event in events.events)
 
-    merges = [e for e in events.events if isinstance(e, DataPointsMerged)]
-    assert [
-        (sorted((m.data_point_type, m.value) for m in e.added), [(m.data_point_type, m.value) for m in e.updated])
-        for e in merges
-    ] == [
-        ([('Flag', True), ('Ip', 'seeded')], []),
-        ([('Ip', '1')], [('Ip', 'seeded')]),
+    merged = [e for e in events.events if isinstance(e, DataPointMerged)]
+    assert [(e.data_point_type, e.value, e.merge) for e in merged] == [
+        ('Flag', True, 'added'),
+        ('Ip', 'seeded', 'added'),
+        ('Ip', '1', 'added'),
+        ('Ip', 'seeded', 'updated'),
     ]
-    assert (
-        merges[-1].updated[0].retrieved_by == 'seed' and merges[-1].revision == 2
-    )  # an update keeps the first observer
+    assert merged[-1].retrieved_by == 'seed' and merged[-1].revision == 2  # an update keeps the first observer
 
     runs = {(e.operator_id, e.outcome, e.error) for e in events.events if isinstance(e, OperatorRunCompleted)}
     assert runs == {('producer', 'succeeded', None), ('broken', 'failed', 'boom')}
