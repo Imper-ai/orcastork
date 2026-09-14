@@ -8,10 +8,10 @@ scheduled by the loop on the injected clock (never an in-task sleep). When nothi
 and no window is armed, the session is quiescent: the gathered DataPoints are returned.
 
 The whole session is bounded by ``session_deadline`` on the same clock: the deadline is checked
-between passes and caps every window the loop waits out, and when it passes the in-flight
-operators are cancelled (their already-streamed emissions are kept), so a flow that keeps
-re-triggering itself cannot hold a process forever. A single operator run is bounded by its
-own timeout, so the overshoot past the deadline is at most one operation timeout.
+between passes, caps every window the loop waits out, and caps every run launched — a run's
+timeout is clipped to the budget left, so no operator outlives the deadline — and when it
+passes the in-flight operators are cancelled (their already-streamed emissions are kept), so a
+flow that keeps re-triggering itself cannot hold a process forever.
 
 The loop is the **sole writer** of the session state: operators only stream emissions onto a
 queue. It publishes every change — a merge, a run outcome, an activation, the completion — to
@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Iterable, Sequence
+from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any, Literal
 
@@ -58,49 +59,48 @@ class SessionResult(BaseModel):
     deadline_hit: bool  # the session deadline ended gathering before it went quiescent
 
 
-class _Emitted(BaseModel):
-    model_config = ConfigDict(frozen=True)
-
+# The loop's own signals and records are dataclasses, not pydantic models: the loop is their only
+# constructor, so validation would only check the engine against itself, on every emission.
+@dataclass(frozen=True)
+class _Emitted:
     operator_id: OperatorId
-    data_point: DataPoint  # bare: see InvocationDelta for why the annotation is not parametrized
+    data_point: DataPoint[Any]
 
 
-class _Completed(BaseModel):
-    model_config = ConfigDict(frozen=True, arbitrary_types_allowed=True)
-
+@dataclass(frozen=True)
+class _Completed:
     operator_id: OperatorId
     error: Exception | None
+    # The run's timeout was clipped to the session budget and it hit that clipped bound: the deadline
+    # passed while it ran, which is a cancellation at the deadline, not an operator timeout.
+    cut_by_deadline: bool = False
 
 
-class _Running(BaseModel):
-    model_config = ConfigDict(frozen=True, arbitrary_types_allowed=True)
-
+@dataclass(frozen=True)
+class _Running:
     task: asyncio.Task[None]
     observed_revision: int  # the revision the launch snapshot saw — becomes this run's watermark
 
 
-class _ArmedRetry(BaseModel):
+@dataclass(frozen=True)
+class _ArmedRetry:
     """What a relaunch owes the failure it is retrying: the error to report if it can never run, and the
     watermark the failed run observed, which the retry deliberately left un-advanced."""
-
-    model_config = ConfigDict(frozen=True, arbitrary_types_allowed=True)
 
     error: Exception
     observed_revision: int
     attempts: int
 
 
-class _Runnable(BaseModel):
-    model_config = ConfigDict(frozen=True)
-
+@dataclass(frozen=True)
+class _Runnable:
     operator: type[Operator]
     delta: InvocationDelta
     is_retry: bool
 
 
-class _Plan(BaseModel):
-    model_config = ConfigDict(frozen=True)
-
+@dataclass(frozen=True)
+class _Plan:
     runnable: list[_Runnable]
     next_due_in: float | None  # seconds until the soonest armed-but-not-due window, else None
 
@@ -234,7 +234,8 @@ class Orchestrator:
         queue: asyncio.Queue[_Emitted | _Completed] = asyncio.Queue()
         running: dict[OperatorId, _Running] = {}
         try:
-            while deadline is None or clock.monotonic() < deadline:
+            while not self._deadline_hit and (deadline is None or clock.monotonic() < deadline):
+                remaining = None if deadline is None else deadline - clock.monotonic()
                 view = self._state.view()
                 observed = self._state.revision
                 capabilities = await self._refresh_capabilities(activator, view)
@@ -250,9 +251,9 @@ class Orchestrator:
                     # Recorded at launch: both must reflect what this run saw, not the live state at completion.
                     self._prev_caps[operator_id] = capabilities.available_ids()
                     task = asyncio.create_task(
-                        self._run_one(runnable.operator, runnable.delta, view, capabilities, queue)
+                        self._run_one(runnable.operator, runnable.delta, view, capabilities, queue, remaining)
                     )
-                    running[operator_id] = _Running(task=task, observed_revision=observed)
+                    running[operator_id] = _Running(task, observed)
                     if runnable.is_retry:
                         retries.clear(operator_id)
                         self._armed_retries.pop(operator_id, None)
@@ -274,7 +275,8 @@ class Orchestrator:
                     await clock.sleep(max(0.0, wait))
                     continue
                 return  # nothing running, nothing armed → quiescent
-            # Falling out of the loop condition is exactly a deadline hit.
+            # Falling out of the loop condition is exactly a deadline hit (already flagged when a clipped
+            # run reported it; otherwise the clock crossed the deadline between passes).
             self._deadline_hit = True
             logger.warning(
                 'Session deadline hit; gathering stopped and in-flight operators are cancelled',
@@ -355,18 +357,14 @@ class Orchestrator:
                     )
                     continue
                 if retries.is_due(operator_id):
-                    runnable.append(
-                        _Runnable(operator=operator, delta=self._delta_for(operator, capabilities), is_retry=True)
-                    )
+                    runnable.append(_Runnable(operator, self._delta_for(operator, capabilities), is_retry=True))
                 else:
                     track(retries.due_at(operator_id))
                 continue
             if not ready:
                 continue
             if not self._state.has_run(operator_id):
-                runnable.append(
-                    _Runnable(operator=operator, delta=self._delta_for(operator, capabilities), is_retry=False)
-                )
+                runnable.append(_Runnable(operator, self._delta_for(operator, capabilities), is_retry=False))
                 continue
             if not operator.policy.rerun_on_new_data:
                 continue
@@ -378,11 +376,11 @@ class Orchestrator:
             if not debounce.is_scheduled(operator_id):
                 debounce.schedule(operator_id, window=operator.policy.debounce)
             if debounce.is_due(operator_id):
-                runnable.append(_Runnable(operator=operator, delta=delta, is_retry=False))
+                runnable.append(_Runnable(operator, delta, is_retry=False))
             else:
                 track(debounce.due_at(operator_id))
         next_due_in = None if soonest_due is None else max(0.0, soonest_due - self._runtime.clock.monotonic())
-        return _Plan(runnable=runnable, next_due_in=next_due_in)
+        return _Plan(runnable, next_due_in)
 
     def _delta_for(self, operator: type[Operator], capabilities: CapabilityView) -> InvocationDelta:
         return self._state.delta_for(
@@ -410,6 +408,7 @@ class Orchestrator:
         view: DataPointView,
         capabilities: CapabilityView,
         queue: asyncio.Queue[_Emitted | _Completed],
+        remaining: float | None,
     ) -> None:
         context = OperatorContext(
             session_id=self._session_id,
@@ -426,15 +425,22 @@ class Orchestrator:
             # the queue as produced, so the loop merges it while this operator is still running.
             async for emission in instance.run(context):
                 finalized = emission.finalize(retrieved_by=operator.operator_id, at=clock.now())
-                await queue.put(_Emitted(operator_id=operator.operator_id, data_point=finalized))
+                await queue.put(_Emitted(operator.operator_id, finalized))
 
+        # A run never outlives the session: its timeout is clipped to the budget left, so the deadline
+        # is hard even while the loop is blocked waiting on this run's signals.
+        timeout = self._timeout_for(operator)
+        clipped = remaining is not None and remaining < timeout
+        if clipped and remaining is not None:
+            timeout = remaining
         error: Exception | None = None
         try:
             # Constructed inside the boundary too: an __init__ that raises is a FAILED run, not a lost task.
-            await asyncio.wait_for(drain(operator()), timeout=self._timeout_for(operator))
+            await asyncio.wait_for(drain(operator()), timeout=timeout)
         except Exception as exc:  # operator fault-isolation boundary — never wedge the session
             error = exc
-        await queue.put(_Completed(operator_id=operator.operator_id, error=error))
+        cut_by_deadline = clipped and isinstance(error, TimeoutError)
+        await queue.put(_Completed(operator.operator_id, error, cut_by_deadline))
 
     def _timeout_for(self, operator: type[Operator]) -> float:
         return self._operation_timeout if operator.policy.timeout is None else operator.policy.timeout.total_seconds()
@@ -496,6 +502,15 @@ class Orchestrator:
     ) -> None:
         operator_id = signal.operator_id
         record = running.pop(operator_id)
+        if signal.cut_by_deadline:
+            # Not a run that finished, and not this operator's fault: the session's budget ran out under it.
+            # Reported exactly like a run cancelled by the deadline check, and the loop exits on the flag.
+            self._deadline_hit = True
+            self._failures[operator_id] = _CANCELLED_AT_DEADLINE
+            await self._publish_run(
+                operator_id, 'cancelled', self._failed_attempts.get(operator_id, 0) + 1, signal.error
+            )
+            return
         self._runs[operator_id] = self._runs.get(operator_id, 0) + 1
         # Every attempt counts toward the breaker, so a failing cycle operator cannot loop between the
         # retry scheduler and the cycle forever.
@@ -513,9 +528,7 @@ class Orchestrator:
             )
             # A retried failure keeps its old watermark: the relaunch must re-present the same delta.
             # Its emissions are already merged, and re-emitting them is idempotent (keyed-merge).
-            self._armed_retries[operator_id] = _ArmedRetry(
-                error=signal.error, observed_revision=record.observed_revision, attempts=attempts
-            )
+            self._armed_retries[operator_id] = _ArmedRetry(signal.error, record.observed_revision, attempts)
             await self._publish_run(operator_id, 'retrying', attempts, signal.error)
             return
         await self._record_terminal_failure(operator_id, signal.error, record.observed_revision, attempts)
@@ -543,13 +556,10 @@ class Orchestrator:
         attempt: int,
         error: Exception | None,
     ) -> None:
+        message = None if error is None else (_CANCELLED_AT_DEADLINE if outcome == 'cancelled' else str(error))
         await self._publish(
             OperatorRunCompleted(
-                **self._event_base(),
-                operator_id=operator_id,
-                outcome=outcome,
-                attempt=attempt,
-                error=None if error is None else str(error),
+                **self._event_base(), operator_id=operator_id, outcome=outcome, attempt=attempt, error=message
             )
         )
 

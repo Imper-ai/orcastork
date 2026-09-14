@@ -518,3 +518,27 @@ async def test_a_hanging_event_sink_is_bounded_by_the_publish_timeout(fake_clock
 
     assert result.operator_runs == {'a': 1} and _values(result.data_points, Ip) == ['1']
     assert sink.attempts == 4  # seed merge, emission merge, run completed, session completed — each bounded
+
+
+async def test_session_deadline_is_hard_while_operators_are_running(fake_clock: FakeClock) -> None:
+    # Nothing emits after the seed and nothing advances the fake clock, so the deadline check between
+    # passes alone could never fire: only the clipped run timeout can end this session.
+    sleeper = make_operator('sleeper', depends_on={Flag}, sleep_after=5.0)
+    quick = make_operator('quick', depends_on={Flag}, produces={Ip}, emits=[Ip.emit('1')])
+    events = InMemorySessionEventSink()
+
+    result = await Orchestrator(
+        session_id=SESSION,
+        namespace_id=NAMESPACE,
+        runtime=build_runtime(fake_clock, events=events),
+        operators=[sleeper, quick],
+        seed=[dp(Flag, True, fake_clock.now())],
+        session_deadline=0.05,
+    ).run()
+
+    assert result.deadline_hit
+    assert result.operator_runs == {'quick': 1}  # the sleeper never finished a run of its own
+    assert 'deadline' in result.failures[OperatorId('sleeper')]
+    assert _values(result.data_points, Ip) == ['1']
+    cancelled = [e for e in events.events if isinstance(e, OperatorRunCompleted) and e.outcome == 'cancelled']
+    assert [(e.operator_id, e.error) for e in cancelled] == [('sleeper', result.failures[OperatorId('sleeper')])]

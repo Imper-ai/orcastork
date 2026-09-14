@@ -112,10 +112,14 @@ injected `Clock` only, loop-scheduled windows (never an in-task sleep), sole-wri
 isolation per operator and per capability activation (both bounded by `operation_timeout`), house
 style. Rules that do not: there are no registries (classes are handed to the orchestrator; duplicates
 raise there) and DataPoints have no `type` Literal or `config` — the class is the type, and its
-identity is computed once at construction. Value types in the core are pydantic models, never
-dataclasses (`tools/` is the exception); annotate a `DataPoint` field **bare** — a parametrized
-`DataPoint[Any]` makes pydantic re-validate the instance into that parametrization and lose its
-class. Do not import `orcastork` from it or vice versa, and do not let the removed features creep
+identity is computed once at construction. Pydantic at the public surface, dataclasses inside:
+what a user constructs or reads (`DataPoint`, the policies, the contexts, the events, `SessionResult`,
+`Runtime`) is a pydantic model, while what the loop alone builds (`InvocationDelta`, `MergeOutcome`,
+the state entries, the orchestrator's private signals) is a frozen dataclass — validation pays only
+at a trust boundary, and on the hot path it cost hundreds of microseconds per pass checking the
+engine against itself (measured). In a pydantic model annotate a `DataPoint` field **bare** — a
+parametrized `DataPoint[Any]` makes pydantic re-validate the instance into that parametrization and
+lose its class. Do not import `orcastork` from it or vice versa, and do not let the removed features creep
 back in: the point of the package is what it lacks. `orcastork_lite/tools/` (the `orcastork-lite-graph`
 CLI) is the one subpackage the library must never import; a test enforces it.
 

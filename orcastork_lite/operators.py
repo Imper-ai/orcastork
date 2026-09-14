@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator
+from dataclasses import dataclass
 from datetime import timedelta
 from enum import Enum
 from typing import Any, ClassVar
@@ -98,17 +99,17 @@ class Operator(ABC):
         ...
 
 
-class InvocationDelta(BaseModel):
+@dataclass(frozen=True)
+class InvocationDelta:
     """What changed since *this* operator last ran — so a rerun does incremental work.
 
-    The DataPoint fields are annotated bare on purpose: a parametrized ``DataPoint[Any]`` would make
-    pydantic re-validate each instance into that parametrization and lose its concrete class.
+    A dataclass, not a pydantic model: the loop is its only constructor and builds one per
+    rerun-eligible operator on every pass, so validating hundreds of DataPoints against types the
+    engine itself just computed would cost the hot path hundreds of microseconds per pass for nothing.
     """
 
-    model_config = ConfigDict(frozen=True)
-
-    added: frozenset[DataPoint]  # new identities
-    updated: frozenset[DataPoint]  # existing identities re-observed (last_retrieved bumped)
+    added: frozenset[DataPoint[Any]]  # new identities
+    updated: frozenset[DataPoint[Any]]  # existing identities re-observed (last_retrieved bumped)
     newly_available_caps: frozenset[CapabilityId]  # capabilities that came online since the last run
     is_first_invocation: bool  # first run → `added` is the full current set
 

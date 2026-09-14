@@ -10,29 +10,30 @@ last run observed, so the delta since then splits cleanly into added vs updated.
 from __future__ import annotations
 
 from collections.abc import Iterable
+from dataclasses import dataclass
 from typing import Any
-
-from pydantic import BaseModel, ConfigDict
 
 from .datapoints import DataPoint, DataPointView, identity_key
 from .ids import CapabilityId, OperatorId
 from .operators import InvocationDelta
 
 
-class _Entry(BaseModel):
-    data_point: DataPoint  # bare: see InvocationDelta for why the annotation is not parametrized
+# Engine internals are dataclasses, not pydantic models: the loop is their only constructor, so
+# validation would only check the engine against itself — on the hot path, per merge and per pass.
+@dataclass
+class _Entry:
+    data_point: DataPoint[Any]
     added_rev: int
     updated_rev: int
 
 
-class MergeOutcome(BaseModel):
+@dataclass(frozen=True)
+class MergeOutcome:
     """What one ``merge`` did: the resulting revision and which DataPoints were new vs freshened."""
 
-    model_config = ConfigDict(frozen=True)
-
     revision: int
-    added: tuple[DataPoint, ...]
-    updated: tuple[DataPoint, ...]
+    added: tuple[DataPoint[Any], ...]
+    updated: tuple[DataPoint[Any], ...]
 
     @property
     def changed(self) -> bool:

@@ -94,7 +94,8 @@ operator run and one capability activation, and `session_deadline` (default 300s
 unbounded) caps the whole session on the injected clock. The deadline is checked between passes and
 clips every window the loop waits out; when it passes, in-flight operators are cancelled, their
 already-streamed emissions are kept, and each is reported in `result.failures`; `result.deadline_hit`
-says it happened. A run in flight can overshoot by at most its own timeout.
+says it happened. A launched run's timeout is clipped to the budget left, so no run outlives the
+deadline: an operator cut this way is reported as cancelled at the deadline, not as its own timeout.
 
 `uses` types re-trigger a rerun but never gate readiness. `consumes` marks the sink types a flow
 exists to produce: when any operator declares it, operators whose output cannot reach a sink are
