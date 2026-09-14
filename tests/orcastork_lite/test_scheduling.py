@@ -70,3 +70,15 @@ def test_backoff_is_exponential_deterministic_and_bounded_by_jitter() -> None:
 def test_retry_policy_rejects_degenerate_values(kwargs: dict[str, float]) -> None:
     with pytest.raises(ValueError):
         RetryPolicy(**kwargs)  # type: ignore[arg-type]
+
+
+def test_policies_are_frozen_pydantic_models() -> None:
+    from pydantic import ValidationError
+
+    from orcastork_lite import OperatorPolicy
+
+    policy = OperatorPolicy(rerun_on_new_data=True)
+    with pytest.raises(ValidationError):
+        policy.rerun_on_new_data = False  # type: ignore[misc]
+    with pytest.raises(ValidationError):
+        OperatorPolicy()  # type: ignore[call-arg]

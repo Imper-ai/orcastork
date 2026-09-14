@@ -11,10 +11,11 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator
-from dataclasses import dataclass
 from datetime import timedelta
 from enum import Enum
 from typing import Any, ClassVar
+
+from pydantic import BaseModel, ConfigDict, Field
 
 from .capabilities import Capability, CapabilityView
 from .datapoints import DataPoint, DataPointEmission, DataPointView
@@ -35,27 +36,23 @@ class RerunOn(Enum):
     ADDED_ONLY = 'added_only'
 
 
-@dataclass(frozen=True)
-class RetryPolicy:
-    """Bounded relaunch-on-failure with a jittered exponential backoff (``base_delay * 2**attempt``)."""
+class RetryPolicy(BaseModel):
+    """Bounded relaunch-on-failure with a jittered exponential backoff (``base_delay * 2**attempt``).
 
-    max_attempts: int = 5
-    base_delay: float = 0.05  # seconds
-    jitter: float = 0.2  # ±20% multiplicative jitter
+    The bounds fail fast on a misconfigured policy rather than abandoning the operator on its first
+    failure (``max_attempts < 1``) or producing a negative or degenerate backoff schedule.
+    """
 
-    def __post_init__(self) -> None:
-        # Fail fast on a misconfigured policy rather than abandoning the operator on its first failure
-        # (max_attempts < 1) or producing a negative/degenerate backoff schedule.
-        if self.max_attempts < 1:
-            raise ValueError(f'max_attempts must be >= 1, got {self.max_attempts}')
-        if self.base_delay < 0.0:
-            raise ValueError(f'base_delay must be >= 0.0, got {self.base_delay}')
-        if not 0.0 <= self.jitter <= 1.0:
-            raise ValueError(f'jitter must be within [0.0, 1.0], got {self.jitter}')
+    model_config = ConfigDict(frozen=True)
+
+    max_attempts: int = Field(default=5, ge=1)
+    base_delay: float = Field(default=0.05, ge=0.0)  # seconds
+    jitter: float = Field(default=0.2, ge=0.0, le=1.0)  # multiplicative jitter, ±jitter
 
 
-@dataclass(frozen=True)
-class OperatorPolicy:
+class OperatorPolicy(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
     rerun_on_new_data: bool  # NO DEFAULT — the author must decide whether new data re-triggers this operator
     # Consulted only when rerun_on_new_data=True; inert otherwise (deliberately not a validation error).
     rerun_on: RerunOn = RerunOn.ADDED_OR_UPDATED
@@ -101,18 +98,24 @@ class Operator(ABC):
         ...
 
 
-@dataclass(frozen=True)
-class InvocationDelta:
-    """What changed since *this* operator last ran — so a rerun does incremental work."""
+class InvocationDelta(BaseModel):
+    """What changed since *this* operator last ran — so a rerun does incremental work.
 
-    added: frozenset[DataPoint[Any]]  # new identities
-    updated: frozenset[DataPoint[Any]]  # existing identities re-observed (last_retrieved bumped)
+    The DataPoint fields are annotated bare on purpose: a parametrized ``DataPoint[Any]`` would make
+    pydantic re-validate each instance into that parametrization and lose its concrete class.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    added: frozenset[DataPoint]  # new identities
+    updated: frozenset[DataPoint]  # existing identities re-observed (last_retrieved bumped)
     newly_available_caps: frozenset[CapabilityId]  # capabilities that came online since the last run
     is_first_invocation: bool  # first run → `added` is the full current set
 
 
-@dataclass(frozen=True)
-class OperatorContext:
+class OperatorContext(BaseModel):
+    model_config = ConfigDict(frozen=True, arbitrary_types_allowed=True)
+
     session_id: SessionId
     namespace_id: NamespaceId
     store: DataPointView

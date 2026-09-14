@@ -9,8 +9,10 @@ asks for it, and is timeout-bounded and fault-isolated throughout. When nothing 
 the session is complete and the gathered DataPoints are returned.
 
 It deliberately has **no** durability, resumability, fencing epochs, locks, inbox, parking,
-aggregators, durable store, audit trail, archive, telemetry, `ctx.once`, Redis or Mongo. A session
-lives and dies inside one process; if you need any of that, use `orcastork`.
+aggregators, durable store, audit trail, archive, telemetry or `ctx.once`. A session lives and dies
+inside one process, bounded by a session deadline; the only thing that leaves the process while it
+runs is a stream of **session events** (optionally onto a Redis stream) so a consumer can react to a
+DataPoint the moment it lands. If you need any of the rest, use `orcastork`.
 
 ## Quickstart
 
@@ -68,7 +70,7 @@ Nothing declared an order. Add a second operator that depends on `Title` and it 
 |---|---|---|
 | `DataPoint[V]` subclass | nothing — the class is the type; any subclass may be used as an abstract dependency | — |
 | `Operator` subclass | `operator_id`, `policy`, `depends_on`, `uses`, `produces`, `requires`, `consumes` | `async def run(ctx) -> AsyncIterator[DataPointEmission]` (yield `Leaf.emit(value)`) |
-| `Capability` subclass | `capability_id`, `depends_on`, `requires` | `async def activate(ctx)` (build a client from `ctx.credentials`) plus your own typed action methods |
+| `Capability` subclass | `capability_id`, `depends_on`, `requires` | `async def activate(ctx)` (build a client from `ctx.credentials`; `ctx.namespace_id` lets you cache one per tenant) plus your own typed action methods |
 
 Operators and capabilities are passed to the orchestrator as **classes**; a fresh no-argument
 instance is constructed per run. There are no registries: two classes with the same id in one
@@ -87,6 +89,13 @@ orchestrator raise `DuplicateIdError`.
 - `max_cycles=N`: required for an operator on a dependency cycle (it bounds the loop); an unbounded
   cycle is rejected at construction with `UnboundedCycleError`.
 
+**Session-wide bounds** live on the `Orchestrator`: `operation_timeout` (default 30s) caps one
+operator run and one capability activation, and `session_deadline` (default 300s, `None` for
+unbounded) caps the whole session on the injected clock. The deadline is checked between passes and
+clips every window the loop waits out; when it passes, in-flight operators are cancelled, their
+already-streamed emissions are kept, and each is reported in `result.failures`; `result.deadline_hit`
+says it happened. A run in flight can overshoot by at most its own timeout.
+
 `uses` types re-trigger a rerun but never gate readiness. `consumes` marks the sink types a flow
 exists to produce: when any operator declares it, operators whose output cannot reach a sink are
 pruned before the session starts.
@@ -102,8 +111,31 @@ pruned before the session starts.
   run (`permitted_operators` returning `None` means unrestricted; an empty set means run nothing),
   which credentials each capability gets, and the provider preference. `InMemoryCapabilityCatalog`
   is the shipped implementation; a deployment writes its own over its configuration store.
-- **`Runtime(clock, catalog)`** is the whole injected bundle. Tests pass a fake `Clock`, so debounce
-  windows and retry backoff run against controlled time.
+- **`Runtime(clock, catalog, events)`** is the whole injected bundle. Tests pass a fake `Clock`, so
+  debounce windows and retry backoff run against controlled time.
+
+### Following a session while it runs
+
+Session state is private to the orchestrator, so the loop publishes every change to the runtime's
+`SessionEventSink`: a `DataPointMerged` per DataPoint added or freshened (with its value, provenance
+and the session revision), an `OperatorRunCompleted` per finished run (`succeeded`, `failed`,
+`retrying`, `cancelled`), a `CapabilityActivated` per activation outcome, and one `SessionCompleted`.
+The default sink drops them. `orcastork_lite.adapters.memory.InMemorySessionEventSink` keeps them in a
+list; `orcastork_lite.adapters.redis.RedisSessionEventSink` appends each to a Redis stream per session
+(`orcastork_lite:events:<session_id>`, field `kind` plus the event as JSON, capped by `maxlen`):
+
+```python
+from redis.asyncio import Redis
+from orcastork_lite import build_runtime
+from orcastork_lite.adapters.redis import RedisSessionEventSink
+
+runtime = build_runtime(events=RedisSessionEventSink(Redis.from_url('redis://localhost')))
+# a consumer: XREAD BLOCK 0 STREAMS orcastork_lite:events:run-1 $
+```
+
+A sink that raises is logged and the event dropped; publishing never stops the session. Capability
+activation is bounded by `operation_timeout` for the same reason: it runs on the gathering loop, and
+a hung client build would otherwise stall every operator, not only the ones that need it.
 
 ## Graph tool (separate)
 

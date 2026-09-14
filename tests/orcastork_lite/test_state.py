@@ -16,10 +16,13 @@ OP = OperatorId('op')
 def test_merge_adds_then_updates_and_advances_revision_only_on_change(fake_clock: FakeClock) -> None:
     now = fake_clock.now()
     state = SessionState()
-    assert state.merge([dp(Ip, 'a', now)]) == 1
-    assert state.merge([dp(Ip, 'a', now)]) == 1  # identical re-observation: nothing changed
-    assert state.merge([dp(Ip, 'a', now + timedelta(seconds=1))]) == 2  # fresher sighting: updated
-    assert state.merge([]) == 2
+    first = state.merge([dp(Ip, 'a', now)])
+    assert (first.revision, first.added, first.updated) == (1, (dp(Ip, 'a', now),), ())
+    same = state.merge([dp(Ip, 'a', now)])  # identical re-observation: nothing changed
+    assert same.revision == 1 and not same.changed
+    fresher = state.merge([dp(Ip, 'a', now + timedelta(seconds=1))])  # fresher sighting: updated
+    assert fresher.revision == 2 and fresher.updated == (dp(Ip, 'a', now),) and not fresher.added
+    assert state.merge([]).revision == 2
 
     (only,) = state.view().all()
     assert (only.first_retrieved, only.last_retrieved) == (now, now + timedelta(seconds=1))
@@ -39,8 +42,7 @@ def test_first_invocation_delta_is_the_whole_set(fake_clock: FakeClock) -> None:
 def test_delta_after_watermark_splits_added_and_updated(fake_clock: FakeClock) -> None:
     now = fake_clock.now()
     state = SessionState()
-    revision = state.merge([dp(Ip, 'a', now)])
-    state.advance_watermark(OP, revision)
+    state.advance_watermark(OP, state.merge([dp(Ip, 'a', now)]).revision)
     state.merge([dp(Ip, 'a', now + timedelta(seconds=1)), dp(Ip, 'b', now)])
 
     delta = state.delta_for(OP, previous_caps=frozenset({'x'}), available_caps=frozenset({'x', 'y'}))  # type: ignore[arg-type]

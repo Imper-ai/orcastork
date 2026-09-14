@@ -22,6 +22,15 @@ from .capabilities import (
 )
 from .clock import Clock, SystemClock
 from .datapoints import DataPoint, DataPointEmission, DataPointView, identity_key
+from .events import (
+    CapabilityActivated,
+    DataPointMerged,
+    NullSessionEventSink,
+    OperatorRunCompleted,
+    SessionCompleted,
+    SessionEvent,
+    SessionEventSink,
+)
 from .exceptions import (
     CapabilityUnavailableError,
     DuplicateIdError,
@@ -32,11 +41,19 @@ from .exceptions import (
 )
 from .ids import CapabilityId, NamespaceId, OperatorId, SessionId
 from .operators import InvocationDelta, Operator, OperatorContext, OperatorPolicy, RerunOn, RetryPolicy
-from .orchestrator import DEFAULT_OPERATION_TIMEOUT, Orchestrator, SessionResult
+from .orchestrator import DEFAULT_OPERATION_TIMEOUT, DEFAULT_SESSION_DEADLINE, Orchestrator, SessionResult
 from .runtime import Runtime, build_runtime
 
 __all__ = [
+    'SessionEventSink',
+    'SessionEvent',
+    'SessionCompleted',
+    'OperatorRunCompleted',
+    'NullSessionEventSink',
+    'DataPointMerged',
+    'CapabilityActivated',
     'DEFAULT_OPERATION_TIMEOUT',
+    'DEFAULT_SESSION_DEADLINE',
     'Capability',
     'CapabilityActivator',
     'CapabilityCatalog',

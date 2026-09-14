@@ -11,22 +11,29 @@ directly, fully typed.
 
 from __future__ import annotations
 
+import asyncio
 from abc import ABC, abstractmethod
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass
-from typing import Any, ClassVar, Protocol
+from typing import Any, ClassVar, Protocol, runtime_checkable
 
 from loguru import logger
+from pydantic import BaseModel, ConfigDict
 
 from .datapoints import DataPoint, DataPointView
 from .exceptions import CapabilityUnavailableError
 from .ids import CapabilityId, NamespaceId, OperatorId
 
 
-@dataclass(frozen=True)
-class CapabilityContext:
-    """What a capability sees when it activates: its credentials + the current DataPoints."""
+class CapabilityContext(BaseModel):
+    """What a capability sees when it activates: whose session it is, its credentials, the current DataPoints.
 
+    ``namespace_id`` is there so an implementation can key a client cache across sessions of the same
+    namespace (one authenticated HTTP client per tenant, say) instead of rebuilding it per session.
+    """
+
+    model_config = ConfigDict(frozen=True, arbitrary_types_allowed=True)
+
+    namespace_id: NamespaceId
     credentials: Mapping[str, Any]
     store: DataPointView
 
@@ -42,6 +49,7 @@ class Capability(ABC):
         ...
 
 
+@runtime_checkable
 class CapabilityCatalog(Protocol):
     """Per-namespace configuration: what a namespace may run, and the secrets its capabilities need."""
 
@@ -200,9 +208,11 @@ def compute_available(
 class CapabilityActivator:
     """Tracks lazy activation across a session and produces the current ``CapabilityView``.
 
-    Activated instances are cached, so a capability is built at most once. A failed activation is
-    isolated — logged, and the capability stays unavailable for the rest of the session — so one
-    broken provider never wedges the operators that do not need it.
+    Activated instances are cached, so a capability is built at most once. ``activate`` runs on the
+    gathering loop, so it is bounded by ``activation_timeout``: a hung client build (a network call
+    that never returns) would otherwise stall every operator in the session, not just the ones that
+    need this capability. A failed or timed-out activation is isolated — logged, and the capability
+    stays unavailable for the rest of the session — so one broken provider never wedges the rest.
     """
 
     def __init__(
@@ -210,15 +220,21 @@ class CapabilityActivator:
         registered: Mapping[CapabilityId, type[Capability]],
         catalog: CapabilityCatalog,
         namespace_id: NamespaceId,
+        *,
+        activation_timeout: float,
     ) -> None:
         self._registered = dict(registered)
         self._catalog = catalog
         self._namespace_id = namespace_id
+        self._activation_timeout = activation_timeout
         self._activated: dict[CapabilityId, Capability] = {}
         self._failed: set[CapabilityId] = set()
 
     def activated_ids(self) -> frozenset[CapabilityId]:
         return frozenset(self._activated)
+
+    def failed_ids(self) -> frozenset[CapabilityId]:
+        return frozenset(self._failed)
 
     async def refresh(self, store_view: DataPointView) -> CapabilityView:
         permitted = await self._catalog.permitted_capabilities(self._namespace_id)
@@ -257,12 +273,18 @@ class CapabilityActivator:
         capability = self._registered[capability_id]()
         credentials = dict(await self._catalog.credentials(self._namespace_id, capability_id) or {})
         try:
-            await capability.activate(CapabilityContext(credentials=credentials, store=store_view))
+            await asyncio.wait_for(
+                capability.activate(
+                    CapabilityContext(namespace_id=self._namespace_id, credentials=credentials, store=store_view)
+                ),
+                timeout=self._activation_timeout,
+            )
         except Exception:  # capability fault-isolation boundary — the session continues without it
             self._failed.add(capability_id)
             logger.opt(exception=True).warning(
-                'Capability activation failed; it stays unavailable for this session',
+                'Capability activation failed or timed out; it stays unavailable for this session',
                 capability_id=capability_id,
+                activation_timeout=self._activation_timeout,
             )
             return
         self._activated[capability_id] = capability

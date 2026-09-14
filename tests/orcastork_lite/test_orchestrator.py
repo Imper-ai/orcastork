@@ -9,7 +9,9 @@ import pytest
 from loguru import logger
 
 from orcastork_lite import (
+    CapabilityActivated,
     DataPoint,
+    DataPointMerged,
     DuplicateIdError,
     InMemoryCapabilityCatalog,
     InvalidOperatorError,
@@ -18,14 +20,32 @@ from orcastork_lite import (
     OperatorContext,
     OperatorId,
     OperatorPolicy,
+    OperatorRunCompleted,
+    Orchestrator,
     RerunOn,
     RetryPolicy,
+    SessionCompleted,
+    SessionEvent,
     UnboundedCycleError,
+    build_runtime,
 )
+from orcastork_lite.adapters.memory import InMemorySessionEventSink
 from orcastork_lite.ids import CapabilityId
 
 from ..doubles.clock import FakeClock
-from .conftest import NAMESPACE, Email, Flag, Ip, Risk, WorkEmail, dp, make_capability, make_operator, run_session
+from .conftest import (
+    NAMESPACE,
+    SESSION,
+    Email,
+    Flag,
+    Ip,
+    Risk,
+    WorkEmail,
+    dp,
+    make_capability,
+    make_operator,
+    run_session,
+)
 
 
 def _values(result_points: Any, leaf: type[Any]) -> list[Any]:
@@ -309,3 +329,133 @@ async def test_unhashable_emission_fails_only_its_operator(fake_clock: FakeClock
     assert 'bytearray' in result.failures[OperatorId('careless')]
     assert result.operator_runs == {'careless': 1, 'peer': 1}
     assert _values(result.data_points, Ip) == ['1']
+
+
+async def test_session_deadline_bounds_a_flow_that_keeps_retriggering_itself(fake_clock: FakeClock) -> None:
+    def next_ip(ctx: OperatorContext) -> list[Any]:
+        return [Ip.emit(f'10.0.0.{len(ctx.store.of_type(Ip)) + 1}')]
+
+    looper = make_operator(
+        'looper',
+        depends_on={Ip},
+        produces={Ip},
+        rerun_on_new_data=True,
+        max_cycles=1000,
+        debounce=timedelta(seconds=1),
+        emit_factory=next_ip,
+    )
+    result = await Orchestrator(
+        session_id=SESSION,
+        namespace_id=NAMESPACE,
+        runtime=build_runtime(fake_clock),
+        operators=[looper],
+        seed=[dp(Ip, '10.0.0.1', fake_clock.now())],
+        session_deadline=5.0,
+    ).run()
+
+    assert result.deadline_hit
+    assert result.operator_runs == {'looper': 5}  # runs at t=0..4; the pass at t=5 is refused by the deadline
+    assert fake_clock.monotonic() == 5.0  # the last window was clipped to the deadline, never past it
+    assert result.failures == {}
+
+
+async def test_session_deadline_cancels_in_flight_operators_but_keeps_their_emissions(fake_clock: FakeClock) -> None:
+    def long_run(_ctx: OperatorContext) -> list[Any]:
+        fake_clock.advance(10.0)  # this run alone eats the whole budget
+        return [Risk.emit(0.5)]
+
+    hog = make_operator('hog', depends_on={Flag}, produces={Risk}, emit_factory=long_run)
+    slow = make_operator('slow', depends_on={Flag}, produces={Ip}, emits=[Ip.emit('early')], sleep_after=5.0)
+    events = InMemorySessionEventSink()
+
+    result = await Orchestrator(
+        session_id=SESSION,
+        namespace_id=NAMESPACE,
+        runtime=build_runtime(fake_clock, events=events),
+        operators=[hog, slow],
+        seed=[dp(Flag, True, fake_clock.now())],
+        session_deadline=5.0,
+    ).run()
+
+    assert result.deadline_hit
+    assert result.operator_runs == {'hog': 1}  # slow never finished a run
+    assert 'deadline' in result.failures[OperatorId('slow')]
+    assert _values(result.data_points, Ip) == ['early'] and _values(result.data_points, Risk) == [0.5]
+    cancelled = [e for e in events.events if isinstance(e, OperatorRunCompleted) and e.outcome == 'cancelled']
+    assert [e.operator_id for e in cancelled] == ['slow']
+
+
+async def test_unbounded_session_runs_to_quiescence(fake_clock: FakeClock) -> None:
+    a = make_operator('a', depends_on={Flag}, produces={Ip}, emits=[Ip.emit('1')])
+    result = await Orchestrator(
+        session_id=SESSION,
+        namespace_id=NAMESPACE,
+        runtime=build_runtime(fake_clock),
+        operators=[a],
+        seed=[dp(Flag, True, fake_clock.now())],
+        session_deadline=None,
+    ).run()
+    assert not result.deadline_hit and result.operator_runs == {'a': 1}
+
+
+async def test_every_change_is_published_to_the_event_sink_in_order(fake_clock: FakeClock) -> None:
+    cap = make_capability('intel', depends_on={Flag})
+    earlier = fake_clock.now() - timedelta(minutes=1)
+    producer = make_operator(
+        'producer', depends_on={Flag}, requires={cap}, produces={Ip}, emits=[Ip.emit('1'), Ip.emit('seeded')]
+    )
+    broken = make_operator('broken', depends_on={Flag}, raise_error=RuntimeError('boom'))
+    events = InMemorySessionEventSink()
+    catalog = InMemoryCapabilityCatalog(permitted={NAMESPACE: {CapabilityId('intel')}})
+
+    result = await Orchestrator(
+        session_id=SESSION,
+        namespace_id=NAMESPACE,
+        runtime=build_runtime(fake_clock, catalog=catalog, events=events),
+        operators=[producer, broken],
+        capabilities=[cap],
+        seed=[dp(Flag, True, earlier), dp(Ip, 'seeded', earlier)],
+    ).run()
+
+    kinds = [event.kind for event in events.events]
+    assert kinds[:2] == ['data_point_merged', 'data_point_merged']  # the seed, before anything runs
+    assert kinds[2] == 'capability_activated'
+    assert kinds[-1] == 'session_completed'
+    assert all(event.session_id == SESSION and event.namespace_id == NAMESPACE for event in events.events)
+
+    merged = [e for e in events.events if isinstance(e, DataPointMerged)]
+    assert [(e.data_point_type, e.value, e.merge) for e in merged] == [
+        ('Flag', True, 'added'),
+        ('Ip', 'seeded', 'added'),
+        ('Ip', '1', 'added'),
+        ('Ip', 'seeded', 'updated'),
+    ]
+    assert merged[-1].retrieved_by == 'seed' and merged[-1].revision == 2  # an update keeps the first observer
+
+    runs = {(e.operator_id, e.outcome, e.error) for e in events.events if isinstance(e, OperatorRunCompleted)}
+    assert runs == {('producer', 'succeeded', None), ('broken', 'failed', 'boom')}
+    activated = [e for e in events.events if isinstance(e, CapabilityActivated)]
+    assert [(e.capability_id, e.outcome) for e in activated] == [('intel', 'activated')]
+    completed = events.events[-1]
+    assert isinstance(completed, SessionCompleted)
+    assert (completed.operator_runs, completed.failures, completed.deadline_hit) == (
+        result.operator_runs,
+        result.failures,
+        False,
+    )
+
+
+async def test_a_failing_event_sink_never_stops_the_session(fake_clock: FakeClock) -> None:
+    class Exploding:
+        async def publish(self, _event: SessionEvent) -> None:
+            raise ConnectionError('redis is down')
+
+    a = make_operator('a', depends_on={Flag}, produces={Ip}, emits=[Ip.emit('1')])
+    result = await Orchestrator(
+        session_id=SESSION,
+        namespace_id=NAMESPACE,
+        runtime=build_runtime(fake_clock, events=Exploding()),
+        operators=[a],
+        seed=[dp(Flag, True, fake_clock.now())],
+    ).run()
+    assert result.operator_runs == {'a': 1} and _values(result.data_points, Ip) == ['1']

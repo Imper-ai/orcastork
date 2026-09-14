@@ -12,7 +12,6 @@ a base-type dependency through plain ``isinstance``.
 from __future__ import annotations
 
 from collections.abc import Iterable, Iterator
-from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Self
 
@@ -90,14 +89,15 @@ class DataPoint[ValueT](BaseModel):
         The orchestrator stamps provenance (``retrieved_by``) and the observation time when it
         writes the result to the session, so operators never fabricate bookkeeping fields.
         """
-        return DataPointEmission(cls, value)
+        return DataPointEmission(leaf_type=cls, value=value)
 
 
-@dataclass(frozen=True)
-class DataPointEmission:
+class DataPointEmission(BaseModel):
     """A value-only DataPoint emitted by an operator (see :meth:`DataPoint.emit`)."""
 
-    leaf_type: type[DataPoint[Any]]
+    model_config = ConfigDict(frozen=True)
+
+    leaf_type: type[DataPoint]  # bare: a parametrized annotation would make pydantic re-validate the class
     value: Any
 
     def finalize(self, *, retrieved_by: OperatorId, at: datetime) -> DataPoint[Any]:

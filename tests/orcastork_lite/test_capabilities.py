@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 from orcastork_lite import (
@@ -41,12 +43,17 @@ def test_availability_is_a_fixpoint_gated_by_permission_data_and_layering() -> N
 
 async def test_activation_is_lazy_once_ordered_base_before_layer_and_uses_credentials(fake_clock: FakeClock) -> None:
     order: list[str] = []
-    base = make_capability('base', depends_on={Email}, record_order=order)
+    contexts: list[CapabilityContext] = []
+
+    async def remember(ctx: CapabilityContext) -> None:
+        contexts.append(ctx)
+
+    base = make_capability('base', depends_on={Email}, record_order=order, on_activate=remember)
     layer = make_capability('layer', requires={base}, record_order=order)
     catalog = InMemoryCapabilityCatalog(
         permitted={NAMESPACE: {BASE, LAYER}}, credentials={(NAMESPACE, BASE): {'token': 't-1'}}
     )
-    activator = CapabilityActivator({LAYER: layer, BASE: base}, catalog, NAMESPACE)
+    activator = CapabilityActivator({LAYER: layer, BASE: base}, catalog, NAMESPACE, activation_timeout=30.0)
 
     empty = await activator.refresh(DataPointView([]))
     assert not empty.available_ids() and order == []
@@ -55,6 +62,7 @@ async def test_activation_is_lazy_once_ordered_base_before_layer_and_uses_creden
     assert view.available_ids() == {BASE, LAYER}
     assert order == ['base', 'layer']
     assert await view.require(base).token() == 't-1'
+    assert contexts[0].namespace_id == NAMESPACE  # so an implementation can cache clients per namespace
 
     await activator.refresh(DataPointView([dp(WorkEmail, 'w', fake_clock.now())]))
     assert order == ['base', 'layer']  # constructed at most once per session
@@ -69,7 +77,7 @@ async def test_failed_activation_is_isolated_and_never_retried() -> None:
     broken = make_capability('base', on_activate=explode, record_order=attempts)
     healthy = make_capability('other')
     catalog = InMemoryCapabilityCatalog(permitted={NAMESPACE: {BASE, OTHER}})
-    activator = CapabilityActivator({BASE: broken, OTHER: healthy}, catalog, NAMESPACE)
+    activator = CapabilityActivator({BASE: broken, OTHER: healthy}, catalog, NAMESPACE, activation_timeout=30.0)
 
     for _ in range(3):
         view = await activator.refresh(DataPointView([]))
@@ -80,7 +88,7 @@ async def test_failed_activation_is_isolated_and_never_retried() -> None:
 async def test_revocation_blocks_new_resolution_without_destroying_the_instance() -> None:
     cap = make_capability('base')
     catalog = InMemoryCapabilityCatalog(permitted={NAMESPACE: {BASE}})
-    activator = CapabilityActivator({BASE: cap}, catalog, NAMESPACE)
+    activator = CapabilityActivator({BASE: cap}, catalog, NAMESPACE, activation_timeout=30.0)
     assert (await activator.refresh(DataPointView([]))).is_available(BASE)
 
     catalog.set_permitted(NAMESPACE, [])
@@ -112,3 +120,21 @@ async def test_catalog_hands_back_copies_and_defaults() -> None:
     assert await catalog.preferred_order(NAMESPACE) == ()
     assert await catalog.permitted_capabilities(NAMESPACE) == frozenset()
     assert Ip is not Email  # keep the zoo import honest for the reader
+
+
+async def test_activation_is_bounded_by_the_activation_timeout() -> None:
+    attempts: list[str] = []
+
+    async def hang(_ctx: CapabilityContext) -> None:
+        await asyncio.sleep(5.0)
+
+    hanging = make_capability('base', on_activate=hang, record_order=attempts)
+    quick = make_capability('other')
+    catalog = InMemoryCapabilityCatalog(permitted={NAMESPACE: {BASE, OTHER}})
+    activator = CapabilityActivator({BASE: hanging, OTHER: quick}, catalog, NAMESPACE, activation_timeout=0.02)
+
+    view = await activator.refresh(DataPointView([]))
+    assert view.available_ids() == {OTHER}
+    assert activator.failed_ids() == {BASE}
+    await activator.refresh(DataPointView([]))
+    assert attempts == ['base']  # a timed-out activation is terminal for the session, like a raise

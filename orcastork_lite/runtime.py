@@ -1,19 +1,31 @@
-"""``Runtime`` — the injected bundle the orchestrator depends on: the clock and the catalog."""
+"""``Runtime`` — the injected bundle the orchestrator depends on: the clock, the catalog, the event sink."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from pydantic import BaseModel, ConfigDict, Field
 
 from .capabilities import CapabilityCatalog, InMemoryCapabilityCatalog
 from .clock import Clock, SystemClock
+from .events import NullSessionEventSink, SessionEventSink
 
 
-@dataclass(frozen=True)
-class Runtime:
-    clock: Clock = field(default_factory=SystemClock)
-    catalog: CapabilityCatalog = field(default_factory=InMemoryCapabilityCatalog)
+class Runtime(BaseModel):
+    model_config = ConfigDict(frozen=True, arbitrary_types_allowed=True)
+
+    clock: Clock = Field(default_factory=SystemClock)
+    catalog: CapabilityCatalog = Field(default_factory=InMemoryCapabilityCatalog)
+    events: SessionEventSink = Field(default_factory=NullSessionEventSink)
 
 
-def build_runtime(clock: Clock | None = None, *, catalog: CapabilityCatalog | None = None) -> Runtime:
-    """Build a runtime; unspecified parts fall back to the system clock and an empty in-memory catalog."""
-    return Runtime(clock=clock or SystemClock(), catalog=catalog or InMemoryCapabilityCatalog())
+def build_runtime(
+    clock: Clock | None = None,
+    *,
+    catalog: CapabilityCatalog | None = None,
+    events: SessionEventSink | None = None,
+) -> Runtime:
+    """Build a runtime; unspecified parts fall back to the system clock, an empty catalog and no event sink."""
+    return Runtime(
+        clock=clock or SystemClock(),
+        catalog=catalog or InMemoryCapabilityCatalog(),
+        events=events or NullSessionEventSink(),
+    )
