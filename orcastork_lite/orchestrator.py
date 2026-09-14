@@ -76,6 +76,17 @@ class _Running(BaseModel):
     observed_revision: int  # the revision the launch snapshot saw — becomes this run's watermark
 
 
+class _ArmedRetry(BaseModel):
+    """What a relaunch owes the failure it is retrying: the error to report if it can never run, and the
+    watermark the failed run observed, which the retry deliberately left un-advanced."""
+
+    model_config = ConfigDict(frozen=True, arbitrary_types_allowed=True)
+
+    error: Exception
+    observed_revision: int
+    attempts: int
+
+
 class _Runnable(BaseModel):
     model_config = ConfigDict(frozen=True)
 
@@ -123,6 +134,7 @@ class Orchestrator:
         self._runs: dict[OperatorId, int] = {}
         self._failures: dict[OperatorId, str] = {}
         self._failed_attempts: dict[OperatorId, int] = {}  # consecutive failures of the current retry sequence
+        self._armed_retries: dict[OperatorId, _ArmedRetry] = {}  # the failure each armed retry window stands for
         self._prev_caps: dict[OperatorId, frozenset[CapabilityId]] = {}
         self._undeclared_emissions: set[tuple[OperatorId, type[DataPoint[Any]]]] = set()
         self._published_caps: set[CapabilityId] = set()
@@ -221,7 +233,7 @@ class Orchestrator:
                 view = self._state.view()
                 observed = self._state.revision
                 capabilities = await self._refresh_capabilities(activator, view)
-                plan = self._plan(view, capabilities, debounce, retries, running)
+                plan = await self._plan(view, capabilities, debounce, retries, running)
                 for runnable in plan.runnable:
                     operator_id = runnable.operator.operator_id
                     logger.debug(
@@ -236,7 +248,11 @@ class Orchestrator:
                         self._run_one(runnable.operator, runnable.delta, view, capabilities, queue)
                     )
                     running[operator_id] = _Running(task=task, observed_revision=observed)
-                    (retries if runnable.is_retry else debounce).clear(operator_id)
+                    if runnable.is_retry:
+                        retries.clear(operator_id)
+                        self._armed_retries.pop(operator_id, None)
+                    else:
+                        debounce.clear(operator_id)
                 if running:
                     # Block on the first signal, then drain everything already queued behind it and
                     # re-plan once for the whole batch: nothing is delayed, and one snapshot serves all.
@@ -298,7 +314,7 @@ class Orchestrator:
                 emitted.append(signal)
         await self._merge_emissions(emitted)
 
-    def _plan(
+    async def _plan(
         self,
         view: DataPointView,
         capabilities: CapabilityView,
@@ -320,17 +336,27 @@ class Orchestrator:
             operator_id = operator.operator_id
             if operator_id in running or self._breaker.is_tripped(operator_id):
                 continue
-            if not is_ready(operator, present_types=present_types, available_capability_types=available_types):
-                continue
+            ready = is_ready(operator, present_types=present_types, available_capability_types=available_types)
             if retries.is_scheduled(operator_id):
                 # An armed retry owns this operator's next launch: it relaunches even with no new data and
                 # its watermark is deliberately stale, so the rerun path must stand aside until it fires.
+                if not ready:
+                    # Readiness is only ever lost to a capability revocation, so the relaunch can never run:
+                    # the failure it stood for is terminal now, not silently forgotten with the window.
+                    retries.clear(operator_id)
+                    armed = self._armed_retries.pop(operator_id)
+                    await self._record_terminal_failure(
+                        operator_id, armed.error, armed.observed_revision, armed.attempts
+                    )
+                    continue
                 if retries.is_due(operator_id):
                     runnable.append(
                         _Runnable(operator=operator, delta=self._delta_for(operator, capabilities), is_retry=True)
                     )
                 else:
                     track(retries.due_at(operator_id))
+                continue
+            if not ready:
                 continue
             if not self._state.has_run(operator_id):
                 runnable.append(
@@ -482,20 +508,28 @@ class Orchestrator:
             )
             # A retried failure keeps its old watermark: the relaunch must re-present the same delta.
             # Its emissions are already merged, and re-emitting them is idempotent (keyed-merge).
+            self._armed_retries[operator_id] = _ArmedRetry(
+                error=signal.error, observed_revision=record.observed_revision, attempts=attempts
+            )
             await self._publish_run(operator_id, 'retrying', attempts, signal.error)
             return
+        await self._record_terminal_failure(operator_id, signal.error, record.observed_revision, attempts)
+
+    async def _record_terminal_failure(
+        self, operator_id: OperatorId, error: Exception, observed_revision: int, attempts: int
+    ) -> None:
         # Terminal — a later data-driven rerun starts a fresh attempt sequence.
         self._failed_attempts.pop(operator_id, None)
-        self._failures[operator_id] = str(signal.error)
-        logger.opt(exception=signal.error).error(
+        self._failures[operator_id] = str(error)
+        logger.opt(exception=error).error(
             'Operator run failed; its emissions were kept and the scheduler is proceeding',
             operator_id=operator_id,
             attempt=attempts,
         )
-        # Advance to the revision this run *observed*, not the live one: DataPoints merged while it ran were
-        # never seen by it, so they must still count as new data and be able to trigger a rerun.
-        self._state.advance_watermark(operator_id, record.observed_revision)
-        await self._publish_run(operator_id, 'failed', attempts, signal.error)
+        # Advance to the revision the failed run *observed*, not the live one: DataPoints merged while it ran
+        # were never seen by it, so they must still count as new data and be able to trigger a rerun.
+        self._state.advance_watermark(operator_id, observed_revision)
+        await self._publish_run(operator_id, 'failed', attempts, error)
 
     async def _publish_run(
         self,

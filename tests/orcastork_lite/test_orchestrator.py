@@ -459,3 +459,38 @@ async def test_a_failing_event_sink_never_stops_the_session(fake_clock: FakeCloc
         seed=[dp(Flag, True, fake_clock.now())],
     ).run()
     assert result.operator_runs == {'a': 1} and _values(result.data_points, Ip) == ['1']
+
+
+async def test_armed_retry_becomes_terminal_when_the_operator_loses_readiness(fake_clock: FakeClock) -> None:
+    cap = make_capability('intel')
+    catalog = InMemoryCapabilityCatalog(permitted={NAMESPACE: {CapabilityId('intel')}})
+
+    def revoke(_ctx: OperatorContext) -> list[Any]:
+        catalog.set_permitted(NAMESPACE, [])  # the namespace drops the capability while the retry window is armed
+        return []
+
+    flaky = make_operator(
+        'flaky',
+        depends_on={Flag},
+        requires={cap},
+        raise_error=RuntimeError('boom'),
+        retry=RetryPolicy(max_attempts=3, base_delay=1.0, jitter=0.0),
+    )
+    revoker = make_operator('revoker', depends_on={Flag}, emit_factory=revoke)
+    events = InMemorySessionEventSink()
+
+    result = await Orchestrator(
+        session_id=SESSION,
+        namespace_id=NAMESPACE,
+        runtime=build_runtime(fake_clock, catalog=catalog, events=events),
+        operators=[flaky, revoker],
+        capabilities=[cap],
+        seed=[dp(Flag, True, fake_clock.now())],
+    ).run()
+
+    # The relaunch can never run, so the failure it was retrying is terminal — not silently forgotten.
+    assert result.operator_runs == {'flaky': 1, 'revoker': 1}
+    assert result.failures == {'flaky': 'boom'}
+    outcomes = [e.outcome for e in events.events if isinstance(e, OperatorRunCompleted) and e.operator_id == 'flaky']
+    assert outcomes == ['retrying', 'failed']
+    assert fake_clock.monotonic() == 0.0  # nothing waited out a window that could never fire
