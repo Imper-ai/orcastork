@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import timedelta
 from typing import Any
 
@@ -11,7 +12,7 @@ from loguru import logger
 from orcastork_lite import (
     CapabilityActivated,
     DataPoint,
-    DataPointMerged,
+    DataPointsMerged,
     DuplicateIdError,
     InMemoryCapabilityCatalog,
     InvalidOperatorError,
@@ -418,19 +419,22 @@ async def test_every_change_is_published_to_the_event_sink_in_order(fake_clock: 
     ).run()
 
     kinds = [event.kind for event in events.events]
-    assert kinds[:2] == ['data_point_merged', 'data_point_merged']  # the seed, before anything runs
-    assert kinds[2] == 'capability_activated'
+    assert kinds[0] == 'data_points_merged'  # the seed, one event for both DataPoints, before anything runs
+    assert kinds[1] == 'capability_activated'
     assert kinds[-1] == 'session_completed'
     assert all(event.session_id == SESSION and event.namespace_id == NAMESPACE for event in events.events)
 
-    merged = [e for e in events.events if isinstance(e, DataPointMerged)]
-    assert [(e.data_point_type, e.value, e.merge) for e in merged] == [
-        ('Flag', True, 'added'),
-        ('Ip', 'seeded', 'added'),
-        ('Ip', '1', 'added'),
-        ('Ip', 'seeded', 'updated'),
+    merges = [e for e in events.events if isinstance(e, DataPointsMerged)]
+    assert [
+        (sorted((m.data_point_type, m.value) for m in e.added), [(m.data_point_type, m.value) for m in e.updated])
+        for e in merges
+    ] == [
+        ([('Flag', True), ('Ip', 'seeded')], []),
+        ([('Ip', '1')], [('Ip', 'seeded')]),
     ]
-    assert merged[-1].retrieved_by == 'seed' and merged[-1].revision == 2  # an update keeps the first observer
+    assert (
+        merges[-1].updated[0].retrieved_by == 'seed' and merges[-1].revision == 2
+    )  # an update keeps the first observer
 
     runs = {(e.operator_id, e.outcome, e.error) for e in events.events if isinstance(e, OperatorRunCompleted)}
     assert runs == {('producer', 'succeeded', None), ('broken', 'failed', 'boom')}
@@ -494,3 +498,26 @@ async def test_armed_retry_becomes_terminal_when_the_operator_loses_readiness(fa
     outcomes = [e.outcome for e in events.events if isinstance(e, OperatorRunCompleted) and e.operator_id == 'flaky']
     assert outcomes == ['retrying', 'failed']
     assert fake_clock.monotonic() == 0.0  # nothing waited out a window that could never fire
+
+
+async def test_a_hanging_event_sink_is_bounded_by_the_publish_timeout(fake_clock: FakeClock) -> None:
+    class Stalled:
+        attempts = 0
+
+        async def publish(self, _event: SessionEvent) -> None:
+            self.attempts += 1
+            await asyncio.sleep(5.0)  # a connection that never answers
+
+    sink = Stalled()
+    a = make_operator('a', depends_on={Flag}, produces={Ip}, emits=[Ip.emit('1')])
+    result = await Orchestrator(
+        session_id=SESSION,
+        namespace_id=NAMESPACE,
+        runtime=build_runtime(fake_clock, events=sink),
+        operators=[a],
+        seed=[dp(Flag, True, fake_clock.now())],
+        publish_timeout=0.01,
+    ).run()
+
+    assert result.operator_runs == {'a': 1} and _values(result.data_points, Ip) == ['1']
+    assert sink.attempts == 4  # seed merge, emission merge, run completed, session completed — each bounded

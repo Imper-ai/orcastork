@@ -32,7 +32,14 @@ from pydantic import BaseModel, ConfigDict
 
 from .capabilities import Capability, CapabilityActivator, CapabilityView
 from .datapoints import DataPoint, DataPointView
-from .events import CapabilityActivated, DataPointMerged, OperatorRunCompleted, SessionCompleted, SessionEvent
+from .events import (
+    CapabilityActivated,
+    DataPointsMerged,
+    MergedDataPoint,
+    OperatorRunCompleted,
+    SessionCompleted,
+    SessionEvent,
+)
 from .exceptions import DuplicateIdError
 from .graph import backward_reachable, build_edges, cycle_caps, validate_acyclic_or_bounded
 from .ids import CapabilityId, NamespaceId, OperatorId, SessionId
@@ -43,6 +50,9 @@ from .state import MergeOutcome, SessionState
 
 DEFAULT_OPERATION_TIMEOUT = 30.0
 DEFAULT_SESSION_DEADLINE = 300.0
+# Short on purpose: an event is published per merge and per run outcome, on the gathering loop, so a
+# stalled sink costs this much per event. Dropping the view beats holding the session that far.
+DEFAULT_PUBLISH_TIMEOUT = 5.0
 _CANCELLED_AT_DEADLINE = 'cancelled: the session deadline passed while the operator was running'
 
 
@@ -114,6 +124,7 @@ class Orchestrator:
         seed: Sequence[DataPoint[Any]] = (),
         operation_timeout: float = DEFAULT_OPERATION_TIMEOUT,
         session_deadline: float | None = DEFAULT_SESSION_DEADLINE,
+        publish_timeout: float = DEFAULT_PUBLISH_TIMEOUT,
     ) -> None:
         self._session_id = session_id
         self._namespace_id = namespace_id
@@ -123,6 +134,7 @@ class Orchestrator:
         self._seed = list(seed)
         self._operation_timeout = operation_timeout
         self._session_deadline = session_deadline  # seconds of session clock; None → unbounded
+        self._publish_timeout = publish_timeout
         self._check_unique_ids()
         self._prune_to_consumed_closure()
         self._operators_by_id = {operator.operator_id: operator for operator in self._operators}
@@ -473,18 +485,22 @@ class Orchestrator:
         await self._publish_merge(self._state.merge(emission.data_point for emission in emitted))
 
     async def _publish_merge(self, outcome: MergeOutcome) -> None:
-        for merge, data_points in (('added', outcome.added), ('updated', outcome.updated)):
-            for data_point in data_points:
-                await self._publish(
-                    DataPointMerged(
-                        **self._event_base(),
-                        data_point_type=type(data_point).__name__,
-                        value=data_point.value,
-                        retrieved_by=data_point.retrieved_by,
-                        merge=merge,
-                        revision=outcome.revision,
-                    )
-                )
+        if not outcome.changed:
+            return
+
+        def describe(data_point: DataPoint[Any]) -> MergedDataPoint:
+            return MergedDataPoint(
+                data_point_type=type(data_point).__name__, value=data_point.value, retrieved_by=data_point.retrieved_by
+            )
+
+        await self._publish(
+            DataPointsMerged(
+                **self._event_base(),
+                added=tuple(describe(data_point) for data_point in outcome.added),
+                updated=tuple(describe(data_point) for data_point in outcome.updated),
+                revision=outcome.revision,
+            )
+        )
 
     async def _record_completion(
         self, signal: _Completed, retries: DebounceController, running: dict[OperatorId, _Running]
@@ -580,13 +596,15 @@ class Orchestrator:
         return {'session_id': self._session_id, 'namespace_id': self._namespace_id, 'at': self._runtime.clock.now()}
 
     async def _publish(self, event: SessionEvent) -> None:
-        # The sink is a view of the session, not part of it: a failing publish is logged and the event
-        # dropped, never allowed to stop the loop.
+        # The sink is a view of the session, not part of it: a publish that raises OR hangs is logged and
+        # the event dropped, never allowed to stop the loop. The bound matters as much as the except — a
+        # stalled connection raises nothing, and the session deadline is only checked between passes.
         try:
-            await self._runtime.events.publish(event)
+            await asyncio.wait_for(self._runtime.events.publish(event), timeout=self._publish_timeout)
         except Exception:  # sink fault-isolation boundary
             logger.opt(exception=True).warning(
-                'Session event publish failed; the event was dropped',
+                'Session event publish failed or timed out; the event was dropped',
                 session_id=self._session_id,
                 event_kind=event.kind,
+                publish_timeout=self._publish_timeout,
             )

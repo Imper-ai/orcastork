@@ -117,12 +117,13 @@ pruned before the session starts.
 ### Following a session while it runs
 
 Session state is private to the orchestrator, so the loop publishes every change to the runtime's
-`SessionEventSink`: a `DataPointMerged` per DataPoint added or freshened (with its value, provenance
-and the session revision), an `OperatorRunCompleted` per finished run (`succeeded`, `failed`,
+`SessionEventSink`: a `DataPointsMerged` per merge batch (every DataPoint added or freshened in one
+pass, with value, provenance and the session revision), an `OperatorRunCompleted` per finished run (`succeeded`, `failed`,
 `retrying`, `cancelled`), a `CapabilityActivated` per activation outcome, and one `SessionCompleted`.
 The default sink drops them. `orcastork_lite.adapters.memory.InMemorySessionEventSink` keeps them in a
 list; `orcastork_lite.adapters.redis.RedisSessionEventSink` appends each to a Redis stream per session
-(`orcastork_lite:events:<session_id>`, field `kind` plus the event as JSON, capped by `maxlen`):
+(`orcastork_lite:events:<session_id>`, field `kind` plus the event as JSON, capped by `maxlen`, and
+expiring on a sliding `ttl`, 24h by default, so finished sessions do not leave keys behind):
 
 ```python
 from redis.asyncio import Redis
@@ -133,7 +134,8 @@ runtime = build_runtime(events=RedisSessionEventSink(Redis.from_url('redis://loc
 # a consumer: XREAD BLOCK 0 STREAMS orcastork_lite:events:run-1 $
 ```
 
-A sink that raises is logged and the event dropped; publishing never stops the session. Capability
+A sink that raises is logged and the event dropped, and each publish is bounded by `publish_timeout`
+(default 5s) so a stalled connection cannot hold the loop either; publishing never stops the session. Capability
 activation is bounded by `operation_timeout` for the same reason: it runs on the gathering loop, and
 a hung client build would otherwise stall every operator, not only the ones that need it.
 

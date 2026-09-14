@@ -24,7 +24,8 @@ from .clock import Clock, SystemClock
 from .datapoints import DataPoint, DataPointEmission, DataPointView, identity_key
 from .events import (
     CapabilityActivated,
-    DataPointMerged,
+    DataPointsMerged,
+    MergedDataPoint,
     NullSessionEventSink,
     OperatorRunCompleted,
     SessionCompleted,
@@ -41,7 +42,13 @@ from .exceptions import (
 )
 from .ids import CapabilityId, NamespaceId, OperatorId, SessionId
 from .operators import InvocationDelta, Operator, OperatorContext, OperatorPolicy, RerunOn, RetryPolicy
-from .orchestrator import DEFAULT_OPERATION_TIMEOUT, DEFAULT_SESSION_DEADLINE, Orchestrator, SessionResult
+from .orchestrator import (
+    DEFAULT_OPERATION_TIMEOUT,
+    DEFAULT_PUBLISH_TIMEOUT,
+    DEFAULT_SESSION_DEADLINE,
+    Orchestrator,
+    SessionResult,
+)
 from .runtime import Runtime, build_runtime
 
 __all__ = [
@@ -50,9 +57,11 @@ __all__ = [
     'SessionCompleted',
     'OperatorRunCompleted',
     'NullSessionEventSink',
-    'DataPointMerged',
+    'DataPointsMerged',
+    'MergedDataPoint',
     'CapabilityActivated',
     'DEFAULT_OPERATION_TIMEOUT',
+    'DEFAULT_PUBLISH_TIMEOUT',
     'DEFAULT_SESSION_DEADLINE',
     'Capability',
     'CapabilityActivator',
