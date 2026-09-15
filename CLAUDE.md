@@ -96,6 +96,33 @@ session-scoped `Orchestrator` (supervised by a `SessionOrchestrationManager`) sc
 - **Manager API is flow-based** — `start_session`/`resume`/`deliver` take a `FlowDefinition`
   (`flow.py`); its fingerprint backs resume drift detection.
 
+## `orcastork_lite/` — the scheduling-only sibling
+
+A second, independent package in the same distribution (`pyproject.toml` `[tool.poetry].packages`).
+It keeps the scheduler (readiness, debounced reruns, `rerun_on`, `uses`, `consumes` pruning, retry
+backoff, timeouts, `max_cycles`, a session deadline) and the dependency injection (capabilities,
+`CapabilityCatalog` with per-namespace operator/capability gating, `Runtime(clock, catalog, events)`)
+and **nothing else**: no store port, epochs, locks, inbox, parking, aggregators, durable store, audit,
+archive, telemetry or `ctx.once`. Session state is an in-memory `SessionState`; `Orchestrator.run()`
+returns the final DataPoints. The one outbound port is the `SessionEventSink` (`events.py`): the loop
+publishes every merge, run outcome, activation and the completion, and a sink that raises is logged
+and dropped. Backends live under `orcastork_lite/adapters/` (in-memory, Redis stream) and nowhere
+else — `tests/test_harness.py` enforces it for both packages. Rules that carry over unchanged:
+injected `Clock` only, loop-scheduled windows (never an in-task sleep), sole-writer loop, fault
+isolation per operator and per capability activation (both bounded by `operation_timeout`), house
+style. Rules that do not: there are no registries (classes are handed to the orchestrator; duplicates
+raise there) and DataPoints have no `type` Literal or `config` — the class is the type, and its
+identity is computed once at construction. Pydantic at the public surface, dataclasses inside:
+what a user constructs or reads (`DataPoint`, the policies, the contexts, the events, `SessionResult`,
+`Runtime`) is a pydantic model, while what the loop alone builds (`InvocationDelta`, `MergeOutcome`,
+the state entries, the orchestrator's private signals) is a frozen dataclass — validation pays only
+at a trust boundary, and on the hot path it cost hundreds of microseconds per pass checking the
+engine against itself (measured). In a pydantic model annotate a `DataPoint` field **bare** — a
+parametrized `DataPoint[Any]` makes pydantic re-validate the instance into that parametrization and
+lose its class. Do not import `orcastork` from it or vice versa, and do not let the removed features creep
+back in: the point of the package is what it lacks. `orcastork_lite/tools/` (the `orcastork-lite-graph`
+CLI) is the one subpackage the library must never import; a test enforces it.
+
 ## Build & test
 
 - `make lint` — `poetry check` + ruff + ruff format --check + mypy.

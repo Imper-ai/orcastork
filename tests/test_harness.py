@@ -17,10 +17,14 @@ import sys
 import tomllib
 from pathlib import Path
 
-import orcastork
+import pytest
 
-PACKAGE_ROOT = Path(orcastork.__file__).parent
-PYPROJECT = PACKAGE_ROOT.parent / 'pyproject.toml'
+import orcastork
+import orcastork_lite
+
+# Both packages in the distribution are held to the same boundaries.
+PACKAGE_ROOTS = [Path(orcastork.__file__).parent, Path(orcastork_lite.__file__).parent]
+PYPROJECT = PACKAGE_ROOTS[0].parent / 'pyproject.toml'
 
 # Distributions that do not import under their own name, or that ship more than one root.
 # `pydantic_core` is pydantic's compiled core, pinned by pydantic itself and the only place
@@ -37,7 +41,7 @@ def _declared_dependencies() -> frozenset[str]:
     requirements = list(project['dependencies'])
     for extra in project.get('optional-dependencies', {}).values():
         requirements.extend(extra)
-    allowed = {'orcastork'}
+    allowed = {'orcastork', 'orcastork_lite'}
     for requirement in requirements:
         # A requirement is `name`, `name>=1.2`, or `name (>=1.2,<2)`; the name is the leading token.
         leading_name = re.match(r'[A-Za-z0-9._-]+', requirement)
@@ -53,8 +57,8 @@ def _declared_dependencies() -> frozenset[str]:
 INFRA_SDKS = frozenset({'redis', 'pymongo', 'motor', 'bson'})
 
 
-def _iter_source_files() -> list[Path]:
-    return sorted(PACKAGE_ROOT.rglob('*.py'))
+def _iter_source_files(package_root: Path) -> list[Path]:
+    return sorted(package_root.rglob('*.py'))
 
 
 def _imported_roots(source: str) -> set[str]:
@@ -69,21 +73,23 @@ def _imported_roots(source: str) -> set[str]:
     return roots
 
 
-def test_hrn_no_module_imports_an_undeclared_dependency() -> None:
+@pytest.mark.parametrize('package_root', PACKAGE_ROOTS, ids=lambda root: root.name)
+def test_hrn_no_module_imports_an_undeclared_dependency(package_root: Path) -> None:
     allowed = _declared_dependencies() | sys.stdlib_module_names
     offenders = {
-        file.relative_to(PACKAGE_ROOT).as_posix(): sorted(roots - allowed)
-        for file in _iter_source_files()
+        file.relative_to(package_root).as_posix(): sorted(roots - allowed)
+        for file in _iter_source_files(package_root)
         if (roots := _imported_roots(file.read_text())) - allowed
     }
     assert not offenders, f'These modules import packages pyproject.toml does not declare: {offenders}'
 
 
-def test_hrn_infra_sdks_confined_to_adapters() -> None:
+@pytest.mark.parametrize('package_root', PACKAGE_ROOTS, ids=lambda root: root.name)
+def test_hrn_infra_sdks_confined_to_adapters(package_root: Path) -> None:
     offenders = {
         rel.as_posix(): sorted(roots & INFRA_SDKS)
-        for file in _iter_source_files()
-        if not (rel := file.relative_to(PACKAGE_ROOT)).as_posix().startswith('adapters/')
+        for file in _iter_source_files(package_root)
+        if not (rel := file.relative_to(package_root)).as_posix().startswith('adapters/')
         and (roots := _imported_roots(file.read_text())) & INFRA_SDKS
     }
     assert not offenders, f'infrastructure SDKs may only be imported under adapters/: {offenders}'

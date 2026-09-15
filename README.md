@@ -127,6 +127,13 @@ The trade is deliberate: you get data-driven scheduling, resumability and an aud
 without a control plane to operate, and you give up cron-style batch scheduling, a built-in
 UI, and cross-language workers.
 
+## Looking for something smaller?
+
+[`orcastork_lite/`](orcastork_lite/README.md) ships in the same distribution and keeps only the
+scheduling core and the dependency injection: operators, capabilities, readiness-driven reruns,
+retries, timeouts and cycle bounding — no durability, resumability, epochs, inbox, aggregators,
+audit or telemetry. A session lives and dies in one process and returns its DataPoints.
+
 ## Documentation
 
 - **[This README](#contents)** — concepts, and the guides for writing an `Operator`,

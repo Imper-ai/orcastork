@@ -9,6 +9,19 @@ under **Changed** with the migration.
 
 ## [Unreleased]
 
+### Added
+
+- **`orcastork_lite`**, a second package in the same distribution: the scheduling core and the
+  dependency injection of orcastork with everything else removed. Operators (`depends_on` /
+  `uses` / `produces` / `requires` / `consumes`, `OperatorPolicy` with rerun, `rerun_on`, debounce,
+  timeout, retry and `max_cycles`), lazily-activated capabilities, a `CapabilityCatalog` with
+  per-namespace gating, and an `Orchestrator` that runs a session to quiescence in one process and
+  returns its DataPoints, bounded by a `session_deadline`. Every change is published to a
+  `SessionEventSink` (in-memory and Redis-stream adapters ship under `orcastork_lite.adapters`) so a
+  consumer can follow a session while it runs. No durability, resumability, epochs, inbox, parking,
+  aggregators, audit, archive or telemetry. The `orcastork-lite-graph` CLI (`orcastork_lite.tools`)
+  validates the cycle policy and renders Mermaid from the classes a module exposes.
+
 ## [0.1.1]
 
 First installable release.
