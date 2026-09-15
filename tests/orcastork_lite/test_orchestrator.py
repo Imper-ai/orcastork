@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import AsyncIterator
 from datetime import timedelta
 from typing import Any
 
@@ -12,6 +13,7 @@ from loguru import logger
 from orcastork_lite import (
     CapabilityActivated,
     DataPoint,
+    DataPointEmission,
     DataPointMerged,
     DuplicateIdError,
     InMemoryCapabilityCatalog,
@@ -542,3 +544,82 @@ async def test_session_deadline_is_hard_while_operators_are_running(fake_clock: 
     assert _values(result.data_points, Ip) == ['1']
     cancelled = [e for e in events.events if isinstance(e, OperatorRunCompleted) and e.outcome == 'cancelled']
     assert [(e.operator_id, e.error) for e in cancelled] == [('sleeper', result.failures[OperatorId('sleeper')])]
+
+
+async def test_an_armed_window_fires_while_a_silent_operator_is_still_running(fake_clock: FakeClock) -> None:
+    # The blocker never emits and outlives the session, so the only way the rerunner's window can come
+    # due is for the loop to honour it while the blocker is in flight. The 0.3s deadline (which clips the
+    # blocker's run) is what ends the session; without the fix the window is starved until then.
+    blocker = make_operator('blocker', depends_on={Flag}, sleep_after=5.0)
+    trigger = make_operator('trigger', depends_on={Flag}, produces={Ip}, emits=[Ip.emit('second')])
+    seen: list[OperatorContext] = []
+    rerunner = make_operator(
+        'rerunner', depends_on={Flag}, uses={Ip}, rerun_on_new_data=True, debounce=timedelta(seconds=0.2), seen=seen
+    )
+
+    result = await Orchestrator(
+        session_id=SESSION,
+        namespace_id=NAMESPACE,
+        runtime=build_runtime(fake_clock),
+        operators=[blocker, trigger, rerunner],
+        seed=[dp(Flag, True, fake_clock.now())],
+        session_deadline=0.3,
+    ).run()
+
+    assert result.operator_runs[OperatorId('rerunner')] == 2  # the debounced rerun happened
+    assert seen[1].delta.added == {dp(Ip, 'second', fake_clock.now())}
+    assert fake_clock.monotonic() == 0.2  # the window was fast-forwarded on the injected clock, not the blocker's exit
+    assert result.deadline_hit and 'deadline' in result.failures[OperatorId('blocker')]
+
+
+async def test_an_operator_that_finishes_during_the_last_pass_is_recorded_not_cancelled(fake_clock: FakeClock) -> None:
+    class Ready(DataPoint[bool]): ...
+
+    peer_may_finish = asyncio.Event()
+
+    class SlowA(Operator):
+        operator_id = OperatorId('slow_a')
+        policy = OperatorPolicy(rerun_on_new_data=False)
+        depends_on = frozenset({Flag})
+        produces = frozenset({Ip})
+
+        async def run(self, _ctx: OperatorContext) -> AsyncIterator[DataPointEmission]:
+            yield Ip.emit('A')
+            await asyncio.sleep(5.0)  # still in flight when the deadline passes
+
+    class QuickB(Operator):
+        operator_id = OperatorId('quick_b')
+        policy = OperatorPolicy(rerun_on_new_data=False)
+        depends_on = frozenset({Flag})
+        produces = frozenset({Ready})
+
+        async def run(self, _ctx: OperatorContext) -> AsyncIterator[DataPointEmission]:
+            await peer_may_finish.wait()
+            yield Ready.emit(True)
+
+    class GatingSink(InMemorySessionEventSink):
+        async def publish(self, event: SessionEvent) -> None:
+            await super().publish(event)
+            if isinstance(event, DataPointMerged) and event.data_point_type == 'Ip':
+                # While the loop is publishing A's merge, B finishes; then the deadline passes.
+                peer_may_finish.set()
+                for _ in range(5):
+                    await asyncio.sleep(0)
+                fake_clock.advance(1.0)
+
+    events = GatingSink()
+    result = await Orchestrator(
+        session_id=SESSION,
+        namespace_id=NAMESPACE,
+        runtime=build_runtime(fake_clock, events=events),
+        operators=[SlowA, QuickB],
+        seed=[dp(Flag, True, fake_clock.now())],
+        session_deadline=0.2,
+    ).run()
+
+    assert result.deadline_hit
+    assert result.data_points.present_types() == {Flag, Ip, Ready}
+    assert result.operator_runs == {'quick_b': 1}  # B finished; it must be counted, not swept as in flight
+    assert set(result.failures) == {'slow_a'}
+    outcomes = [(e.operator_id, e.outcome) for e in events.events if isinstance(e, OperatorRunCompleted)]
+    assert ('quick_b', 'succeeded') in outcomes and ('quick_b', 'cancelled') not in outcomes

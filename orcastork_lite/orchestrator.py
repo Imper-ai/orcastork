@@ -259,20 +259,25 @@ class Orchestrator:
                         self._armed_retries.pop(operator_id, None)
                     else:
                         debounce.clear(operator_id)
-                if running:
-                    # Block on the first signal, then drain everything already queued behind it and
-                    # re-plan once for the whole batch: nothing is delayed, and one snapshot serves all.
-                    signals: list[_Emitted | _Completed] = [await queue.get()]
-                    while not queue.empty():
-                        signals.append(queue.get_nowait())
-                    await self._consume(signals, retries, running)
-                    continue
+                # Seconds until the soonest armed window, never past the deadline; None when nothing is armed.
+                wait: float | None = None
                 if plan.next_due_in is not None:
-                    # Fast-forward to the soonest armed window, never past the deadline.
                     wait = (
                         plan.next_due_in if deadline is None else min(plan.next_due_in, deadline - clock.monotonic())
                     )
-                    await clock.sleep(max(0.0, wait))
+                    wait = max(0.0, wait)
+                if running:
+                    # Wait for the first signal — or for the soonest window to come due, whichever is first: a
+                    # due rerun or retry must not be starved by an in-flight operator that stays quiet. Then
+                    # drain everything already queued behind the signal and re-plan once for the whole batch.
+                    first = await self._next_signal(queue, wait)
+                    if first is None:
+                        continue  # a window came due: re-plan so it launches
+                    signals = [first, *self._drain_signals(queue)]
+                    await self._consume(signals, retries, running)
+                    continue
+                if wait is not None:
+                    await clock.sleep(wait)  # nothing running: fast-forward to the soonest armed window
                     continue
                 return  # nothing running, nothing armed → quiescent
             # Falling out of the loop condition is exactly a deadline hit (already flagged when a clipped
@@ -285,21 +290,49 @@ class Orchestrator:
                 in_flight_operator_ids=sorted(running),
             )
         finally:
-            await self._drain_remaining(queue, running)
+            await self._drain_remaining(queue, retries, running)
+
+    async def _next_signal(
+        self, queue: asyncio.Queue[_Emitted | _Completed], wait: float | None
+    ) -> _Emitted | _Completed | None:
+        """The next queued signal, or ``None`` when an armed window comes due first.
+
+        The timer runs on the injected clock, so under a fake clock this is the same fast-forward the
+        idle branch performs — it just no longer requires nothing to be running. Cancelling a pending
+        ``queue.get`` is safe: a signal that lands afterwards stays queued for the next pass.
+        """
+        if wait is None:
+            return await queue.get()
+        get = asyncio.ensure_future(queue.get())
+        timer = asyncio.ensure_future(self._runtime.clock.sleep(wait))
+        try:
+            await asyncio.wait({get, timer}, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for pending in (get, timer):
+                if not pending.done():
+                    pending.cancel()
+            await asyncio.gather(get, timer, return_exceptions=True)
+        return get.result() if not get.cancelled() else None
 
     async def _drain_remaining(
-        self, queue: asyncio.Queue[_Emitted | _Completed], running: dict[OperatorId, _Running]
+        self,
+        queue: asyncio.Queue[_Emitted | _Completed],
+        retries: DebounceController,
+        running: dict[OperatorId, _Running],
     ) -> None:
         # A quiescent exit reaches here with both empty (a no-op). A deadline hit — or an unexpected
-        # error — reaches here with operators in flight: keep whatever they already emitted, then cancel
-        # them. The deadline is the one signal allowed to stop a running operator.
-        await self._drain_queue(queue)
+        # error — reaches here with operators in flight. Anything already queued is applied first,
+        # completions included: an operator that finished during the last pass's awaits is a finished
+        # run, not an in-flight one, and must be recorded as such rather than swept up as cancelled.
+        # Only what is genuinely still running is then cancelled — the deadline is the one signal
+        # allowed to stop a running operator — and whatever it managed to emit is kept.
+        await self._consume(self._drain_signals(queue), retries, running)
         for record in running.values():
             record.task.cancel()
         if running:
             await asyncio.gather(*(record.task for record in running.values()), return_exceptions=True)
         # A task can enqueue a final emission right as it is cancelled; drain once more so it is not dropped.
-        await self._drain_queue(queue)
+        await self._consume(self._drain_signals(queue), retries, running)
         for operator_id in sorted(running):
             self._failures[operator_id] = _CANCELLED_AT_DEADLINE
             await self._publish(
@@ -313,13 +346,12 @@ class Orchestrator:
             )
         running.clear()
 
-    async def _drain_queue(self, queue: asyncio.Queue[_Emitted | _Completed]) -> None:
-        emitted: list[_Emitted] = []
+    @staticmethod
+    def _drain_signals(queue: asyncio.Queue[_Emitted | _Completed]) -> list[_Emitted | _Completed]:
+        signals: list[_Emitted | _Completed] = []
         while not queue.empty():
-            signal = queue.get_nowait()
-            if isinstance(signal, _Emitted):
-                emitted.append(signal)
-        await self._merge_emissions(emitted)
+            signals.append(queue.get_nowait())
+        return signals
 
     async def _plan(
         self,
