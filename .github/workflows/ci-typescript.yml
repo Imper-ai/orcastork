@@ -1,0 +1,118 @@
+name: CI (TypeScript)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: "22"
+  # Where mongodb-memory-server keeps the server binary it fetches. Named explicitly so the test
+  # job can cache one path instead of caching node_modules, which is where it would land by default.
+  MONGOMS_DOWNLOAD_DIR: ${{ github.workspace }}/.cache/mongodb-binaries
+
+defaults:
+  run:
+    working-directory: typescript
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    env:
+      # Linting never starts a server, so it does not need one fetched during install.
+      MONGOMS_DISABLE_POSTINSTALL: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: typescript/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      # biome check is formatter + linter + import sorting; tsc is the type check `npm run lint` chains.
+      - name: biome + tsc
+        run: npm run lint
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: typescript/package-lock.json
+
+      # The adapter suites talk to real servers: `redis-server` is spawned per suite on a free
+      # port, and Mongo comes from an ephemeral server binary. Nothing here skips — CI is the gate.
+      - name: Install redis-server
+        run: sudo apt-get update && sudo apt-get install -y redis-server
+
+      # Restored before `npm ci`, whose postinstall is what fetches the binary.
+      - uses: actions/cache@v4
+        with:
+          path: ${{ env.MONGOMS_DOWNLOAD_DIR }}
+          key: mongodb-binaries-${{ runner.os }}-${{ hashFiles('typescript/package-lock.json') }}
+          restore-keys: mongodb-binaries-${{ runner.os }}-
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: The server helpers can actually start a server here
+        run: npx vitest run tests/doubles/servers.test.ts
+
+      - name: vitest
+        run: npm run test:coverage
+
+      - name: vitest -- integration
+        run: npm run test:integration
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-typescript
+          path: typescript/coverage/
+          if-no-files-found: ignore
+
+  build:
+    runs-on: ubuntu-latest
+    env:
+      MONGOMS_DISABLE_POSTINSTALL: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: typescript/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      # A packaging error should fail here, not on someone's `npm install`.
+      - name: The published tarball is what the exports map promises
+        run: npm pack --dry-run
+
+      - name: The built entrypoints import from a clean Node process
+        run: |
+          node --input-type=module -e "import('./dist/orcastork/index.js').then((m) => console.log(Object.keys(m)))"
+          node --input-type=module -e "import('./dist/orcastork_lite/index.js').then((m) => console.log(Object.keys(m)))"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-typescript
+          path: typescript/dist/
