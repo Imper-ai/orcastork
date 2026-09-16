@@ -149,7 +149,11 @@ describe.each(PACKAGE_DIRECTORIES)('%s', (packageDirectory) => {
   });
 
   it('never imports the graph CLI under tools/', () => {
+    const toolsRoot = join('src', packageDirectory, 'tools');
     const offenders = allImports(packageDirectory)
+      // The CLI's own modules import each other; what the rule forbids is the *library* reaching
+      // for them, so a file that already lives under `tools/` is not a subject of it.
+      .filter((entry) => !entry.file.startsWith(toolsRoot))
       .filter((entry) => {
         const target = isRelative(entry.specifier) ? resolvedWithin(entry) : entry.specifier;
         return target.split('/').includes('tools');

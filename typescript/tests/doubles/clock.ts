@@ -46,6 +46,8 @@ export class FakeClock implements Clock, LiteClock {
     this.advance(ms);
     // Yield once, so tasks running concurrently with the sleeper interleave — the counterpart of
     // the Python double's `await asyncio.sleep(0)`.
-    await Promise.resolve();
+    await new Promise<void>((resolve) => {
+      setImmediate(resolve);
+    });
   }
 }
