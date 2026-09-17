@@ -19,3 +19,4 @@ export {
   snapshotAllRegistries,
 } from './registry.js';
 export { canonicalValue, stableStringify } from './stable_json.js';
+export { OperationTimeoutError, withTimeout } from './timeouts.js';

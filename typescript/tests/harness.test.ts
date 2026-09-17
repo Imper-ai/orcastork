@@ -30,6 +30,25 @@ const PACKAGE_DIRECTORIES = ['orcastork', 'orcastork_lite'] as const;
  */
 const INFRA_SDKS = ['redis', 'mongodb', 'bson'] as const;
 
+/**
+ * Real-time reads and real timers, which only three modules per package may contain.
+ *
+ * `setImmediate` is deliberately absent: yielding to the event loop is not a time source, and the
+ * root CLAUDE.md sanctions it at an engine loop's own wait points.
+ */
+const REAL_TIME_PATTERN = /\bsetTimeout\b|\bsetInterval\b|\bDate\.now\(\)|\bperformance\.now\(\)|\bnew Date\(\)/;
+
+/**
+ * The modules allowed to read real time, one per reason.
+ *
+ * `clock.ts` is the `SystemClock` itself; `internal/timeouts.ts` is `withTimeout`, the port of
+ * `asyncio.wait_for`, which bounds a real await and so must run on real time; `logging.ts` stamps
+ * its own console records, which is loguru's job in the Python package and never engine logic.
+ * Everything else reads the injected `Clock`, which is what lets a `FakeClock` drive a whole
+ * session deterministically.
+ */
+const REAL_TIME_ALLOWED = ['clock.ts', 'internal/timeouts.ts', 'logging.ts'] as const;
+
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const sourceRoot = join(repositoryRoot, 'src');
 
@@ -143,6 +162,31 @@ describe.each(PACKAGE_DIRECTORIES)('%s', (packageDirectory) => {
     const other = PACKAGE_DIRECTORIES.find((name) => name !== packageDirectory) as string;
     const offenders = allImports(packageDirectory)
       .filter((entry) => (isRelative(entry.specifier) ? resolvedWithin(entry).startsWith(`${other}/`) : false))
+      .map(describeImport);
+
+    expect(offenders).toEqual([]);
+  });
+
+  it('reads real time in no module but the clock, the timeout helper and the logger', () => {
+    const allowed = new Set(REAL_TIME_ALLOWED.map((name) => join('src', packageDirectory, ...name.split('/'))));
+    const offenders = sourceFiles(packageDirectory)
+      .map((file) => relative(repositoryRoot, file))
+      .filter((file) => !allowed.has(file))
+      .filter((file) => REAL_TIME_PATTERN.test(readFileSync(join(repositoryRoot, file), 'utf8')));
+
+    expect(offenders).toEqual([]);
+  });
+
+  it('lets nothing but runtime.ts and the adapters themselves import an adapter', () => {
+    // Core depends on `ports/` only; `runtime.ts` is the single seam that wires a concrete
+    // backend, so a core module reaching for `adapters/` is the ports/adapters boundary breaking
+    // from the inside — which the dependency guard above cannot see, because an adapter is a
+    // relative import.
+    const adaptersRoot = join('src', packageDirectory, 'adapters');
+    const wiringModule = join('src', packageDirectory, 'runtime.ts');
+    const offenders = allImports(packageDirectory)
+      .filter((entry) => entry.file !== wiringModule && !entry.file.startsWith(adaptersRoot))
+      .filter((entry) => isRelative(entry.specifier) && resolvedWithin(entry).split('/').includes('adapters'))
       .map(describeImport);
 
     expect(offenders).toEqual([]);
