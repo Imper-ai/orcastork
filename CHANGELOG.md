@@ -21,6 +21,25 @@ under **Changed** with the migration.
   consumer can follow a session while it runs. No durability, resumability, epochs, inbox, parking,
   aggregators, audit, archive or telemetry. The `orcastork-lite-graph` CLI (`orcastork_lite.tools`)
   validates the cycle policy and renders Mermaid from the classes a module exposes.
+- **A TypeScript port**, in [`typescript/`](typescript/README.md): one npm package `orcastork` with
+  `orcastork` and `orcastork/lite` entrypoints, mirroring both Python packages module for module.
+  All nine ports with their in-memory, Redis (node-redis) and Mongo (mongodb driver) adapters,
+  published as `orcastork/adapters/{memory,redis,mongo}` and `orcastork/lite/adapters/{memory,redis}`
+  with `redis` and `mongodb` as optional peer dependencies; both graph CLIs (`orcastork-graph`,
+  `orcastork-lite-graph`). Everything persisted or published is written in the Python package's
+  wire format — Redis keys, Lua scripts, hash fields, inbox payloads, Mongo collections and document
+  shapes, audit and archive rows, flow fingerprints, the lite event stream — and checked against the
+  Python source and its outputs (identical Lua scripts, key and collection names, document shapes,
+  CPython-generated canonical-value fixtures, an identical fingerprint digest). A mixed Python/Node
+  deployment is the design goal; it has not yet been exercised end to end. Two caveats are
+  documented rather than fixed: a DataPoint value that Python holds as an integral float (`1.0`) gets
+  a different identity in Node, which has one number type; and a node-redis client's `socketTimeout`
+  must exceed the inbox wakeup keepalive (1 s), because node-redis treats that deadline as fatal and
+  does not reconnect. 1,268 tests, one per Python test that has a meaning there, with the port
+  contracts run as shared conformance suites against every adapter family — and against a real
+  `redis-server` and `mongodb-memory-server` rather than in-process fakes. Toolchain: Node ≥ 22,
+  TypeScript strict with ESM/`NodeNext`, TS 5 standard decorators for registration, biome for lint
+  and format, vitest for tests, zod at the public surface only.
 
 ## [0.1.1]
 

@@ -27,6 +27,34 @@ poetry run pytest tests/test_orchestrator.py -x     # one file, stop on first fa
 poetry run pytest --cov=orcastork --cov-report=term-missing
 ```
 
+### The TypeScript toolchain
+
+[`typescript/`](typescript/README.md) is a separate, self-contained npm package with its own
+`Makefile` and the same four verbs. You need **Node ≥ 22**; nothing else.
+
+```bash
+cd typescript
+make deps              # npm ci — the lock file is the dependency list
+make lint              # biome check + tsc --noEmit    (make fix_lint to apply)
+make test              # vitest run
+make test_integration  # the *.integration.test.ts files
+```
+
+`make test` starts the servers it needs: the Redis adapter suites spawn a real `redis-server` on a
+free port and the Mongo suites use `mongodb-memory-server`, so there is nothing to run first and no
+Docker involved. Point `ORCASTORK_TEST_REDIS_URL` / `ORCASTORK_TEST_MONGO_URL` at an already-running
+server to reuse one instead. Without the `redis-server` binary those suites skip with a loud
+warning; CI is the gate, and nothing skips there.
+
+The conventions live in [typescript/CLAUDE.md](typescript/CLAUDE.md) — the layout rule (files mirror
+the Python modules one-to-one, tests mirror `tests/`), the Python → TypeScript idiom table, and the
+architectural guards `tests/harness.test.ts` enforces. Read it before writing code there; the Python
+[CLAUDE.md](CLAUDE.md)'s invariants apply unchanged on top of it. Two things catch people out: a
+change to a public signature also has to land in `typescript/README.md`, because
+`typescript/tests/readme.test.ts` executes that README; and anything persisted or published must
+keep the Python package's exact key names, field names and values, since the two runtimes share a
+keyspace.
+
 ## Before you open a pull request
 
 `make lint && make test` must pass. CI runs exactly those, plus the integration suite, so
