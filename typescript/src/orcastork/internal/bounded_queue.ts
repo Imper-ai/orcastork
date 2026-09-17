@@ -73,6 +73,17 @@ export class BoundedQueue<T> implements AsyncIterable<T> {
       this.getWaiters.push(waiter);
       await waiter.promise;
     }
+    return this.getNowait();
+  }
+
+  /**
+   * Take the oldest item if one is buffered, else `undefined` — never waits.
+   *
+   * The port of `asyncio.Queue.get_nowait()`, without its `QueueEmpty`: the sole-mutator loop
+   * drains everything queued behind the signal it woke on, and an empty queue is the ordinary end
+   * of that drain rather than an exceptional condition.
+   */
+  public getNowait(): T | undefined {
     if (this.items.length === 0) {
       return undefined;
     }

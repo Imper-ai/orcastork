@@ -9,6 +9,8 @@ import {
   InMemoryRateLimiter,
   InMemorySessionLock,
 } from '../../src/orcastork/adapters/memory/index.js';
+import type { RedisRateLimiterClient } from '../../src/orcastork/adapters/redis/index.js';
+import { RedisRateLimiter } from '../../src/orcastork/adapters/redis/index.js';
 import { Epoch, newSessionId, SessionId } from '../../src/orcastork/ids.js';
 import { withTimeout } from '../../src/orcastork/internal/index.js';
 import { EffectClaim, effectPendingState } from '../../src/orcastork/ports/datapoint_store.js';
@@ -19,6 +21,16 @@ import { workEmail } from '../doubles/datapoints.js';
 
 /** One second of token accrual, in the milliseconds the port speaks. */
 const ONE_SECOND_MS = 1000;
+
+/**
+ * A client the Redis limiter must never reach.
+ *
+ * Its constructor guards fire before any command is issued, which is what lets the Redis half of
+ * the token bucket's parity contract live in this infra-free file alongside the in-memory half.
+ */
+const unreachableRedis: RedisRateLimiterClient = {
+  eval: () => Promise.reject(new Error('the constructor guard must fire before any command')),
+};
 
 describe('the in-memory adapter family', () => {
   it('round-trips a DataPoint through a runtime with no infra', async () => {
@@ -127,8 +139,24 @@ describe('the in-memory adapter family', () => {
     expect(() => new InMemoryRateLimiter(clock, { ratePerSecond: 1, burst: -1 })).toThrow(/burst/);
   });
 
-  // The Redis rate limiter's constructor-parity contract (the two adapters reject the same
-  // misconfiguration identically) lands with the Redis adapter.
+  it('rejects a non-positive rate in the Redis limiter identically', () => {
+    // Constructor parity: both limiters promise to wait rather than fail, so both must refuse the
+    // configurations that would break that promise — from the same schema, and before either has
+    // spoken to a backend. Nothing here needs a server; that is the point.
+    const clock = new FakeClock();
+    expect(() => new RedisRateLimiter(unreachableRedis, clock, { ratePerSecond: 0, burst: 1 })).toThrow(
+      /ratePerSecond/,
+    );
+    expect(() => new RedisRateLimiter(unreachableRedis, clock, { ratePerSecond: -1, burst: 1 })).toThrow(
+      /ratePerSecond/,
+    );
+  });
+
+  it('rejects a sub-unit burst in the Redis limiter identically', () => {
+    const clock = new FakeClock();
+    expect(() => new RedisRateLimiter(unreachableRedis, clock, { ratePerSecond: 1, burst: 0 })).toThrow(/burst/);
+    expect(() => new RedisRateLimiter(unreachableRedis, clock, { ratePerSecond: 1, burst: -1 })).toThrow(/burst/);
+  });
 
   it('never lets concurrent waiters share one token', async () => {
     // burst=1, rate=1.0: two tasks both find the bucket empty and sleep. When the clock yields

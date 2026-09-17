@@ -59,3 +59,33 @@ export interface ConformanceBinding<HarnessT extends ConformanceHarness> {
   /** A fresh, empty adapter per test — no state may leak between contracts. */
   create(): Promise<HarnessT>;
 }
+
+/**
+ * The lease width the `SessionLock` contract is written against unless a harness names its own.
+ *
+ * An adapter whose expiry is decided by a `FakeClock` advances half a minute for free, so it keeps
+ * the production default and the contract reads the way the invariant is stated.
+ */
+export const DEFAULT_LEASE_MS = 30_000;
+
+/** The cooldown width the `CooldownGate` contract is written against unless a harness names its own. */
+export const DEFAULT_COOLDOWN_MS = 60_000;
+
+/**
+ * Comfortably past a window of `ms` — what a contract advances to make an expiry certain.
+ *
+ * Every wait in a time-dependent contract is expressed as a multiple of the harness's own window
+ * rather than as an absolute duration, because a backend whose expiry runs on a real server's
+ * clock cannot be fast-forwarded: its binding configures a window of a few hundred milliseconds
+ * and waits it out for real, and the same contract still holds. The margin is generous on purpose
+ * — a real wait competes with scheduling jitter and a round-trip or two.
+ */
+export const pastWindow = (ms: number): number => Math.ceil(ms * 1.5);
+
+/**
+ * A point comfortably inside a window of `ms`.
+ *
+ * Two of these exceed the window, so a contract that advances here, renews, and advances again
+ * proves the renew did the work: without it the lease would already have lapsed.
+ */
+export const withinWindow = (ms: number): number => Math.floor(ms * 0.6);

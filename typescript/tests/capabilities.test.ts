@@ -1,19 +1,15 @@
 /**
  * CAP — capability availability fixpoint, lazy activation, layering, revocation, invocation.
  *
- * The session-level cases need the orchestrator and are ported with it; the Python originals are
- * `test_cap_28_orchestrator_audits_terminal_activation_failure`,
- * `test_cap_38_rate_limit_wait_cancelled_by_per_op_timeout_isolates_and_skips_audit` and
- * `test_cap_39_rate_limit_wait_inside_a_run_paces_then_proceeds_and_audits`.
- *
  * The catalog is the in-memory `CapabilityCatalog` adapter, as in Python — `setPermitted` is how a
  * test models a namespace changing its config between grants.
  */
 
 import { SpanStatusCode } from '@opentelemetry/api';
 import { describe, expect, it } from 'vitest';
-import { InMemoryCapabilityCatalog } from '../src/orcastork/adapters/memory/index.js';
+import { InMemoryCapabilityCatalog, InMemoryRateLimiter } from '../src/orcastork/adapters/memory/index.js';
 import { RetryPolicy } from '../src/orcastork/aggregation/index.js';
+import { AuditKind } from '../src/orcastork/audit/index.js';
 import { capabilityRegistry } from '../src/orcastork/capabilities/base.js';
 import type {
   CapabilityContext,
@@ -21,6 +17,7 @@ import type {
   InvocationAuditor,
 } from '../src/orcastork/capabilities/index.js';
 import { Capability, CapabilityActivator, capability, computeAvailable } from '../src/orcastork/capabilities/index.js';
+import type { DataPointEmission } from '../src/orcastork/datapoints/index.js';
 import { DataPointView } from '../src/orcastork/datapoints/index.js';
 import {
   CapabilityUnavailableError,
@@ -28,12 +25,27 @@ import {
   InvalidCapabilityError,
 } from '../src/orcastork/exceptions.js';
 import type { CapabilityId, NamespaceId } from '../src/orcastork/ids.js';
-import { CapabilityId as toCapabilityId, NamespaceId as toNamespaceId } from '../src/orcastork/ids.js';
-import { CapabilityView } from '../src/orcastork/operators/index.js';
+import {
+  OperatorId,
+  SessionId,
+  CapabilityId as toCapabilityId,
+  NamespaceId as toNamespaceId,
+} from '../src/orcastork/ids.js';
+import { Deferred } from '../src/orcastork/internal/deferred.js';
+import type { OperatorContext } from '../src/orcastork/operators/index.js';
+import { CapabilityView, Operator, OperatorPolicy, operator } from '../src/orcastork/operators/index.js';
+import { Orchestrator, SessionStatus } from '../src/orcastork/orchestrator/index.js';
 import type { RateLimiter } from '../src/orcastork/ports/index.js';
+import { buildInMemoryRuntime } from '../src/orcastork/runtime.js';
 import { makeCapability } from './doubles/capabilities.js';
 import { FakeClock } from './doubles/clock.js';
-import { EmailDataPoint, personalEmail, WorkEmailDataPoint, workEmail } from './doubles/datapoints.js';
+import {
+  ChatAnswerDataPoint,
+  EmailDataPoint,
+  personalEmail,
+  WorkEmailDataPoint,
+  workEmail,
+} from './doubles/datapoints.js';
 import { captureLogs } from './doubles/logs.js';
 import { TelemetryProbe } from './doubles/otel.js';
 
@@ -831,5 +843,170 @@ describe('activation failure, cool-off and terminal disposition', () => {
     const again = await activator.refresh(new DataPointView([workEmail()]));
     expect(again.isAvailable(IDP_ID)).toBe(false);
     expect(cap.attempts).toBe(2); // no re-attempt; the missing callback never crashed the run
+  });
+});
+
+describe('a session activating and calling capabilities', () => {
+  it('audits a terminal activation failure exactly once', async () => {
+    const session = SessionId('cap-session');
+    const catalog = new InMemoryCapabilityCatalog({ permitted: [[NAMESPACE, [IDP_ID]]] });
+    const runtime = buildInMemoryRuntime(new FakeClock(), { catalog });
+    const cap = makeCapability('idp', { activateError: new Error('no creds') });
+
+    const result = await new Orchestrator({
+      sessionId: session,
+      namespaceId: NAMESPACE,
+      runtime,
+      operators: [],
+      capabilities: [cap],
+      retryPolicy: RetryPolicy({ maxAttempts: 1 }), // the first failure exhausts the budget
+    }).run();
+
+    expect(result.status).toBe(SessionStatus.COMPLETED); // the lost capability degrades, never wedges
+    const failures = (await runtime.audit.replay(session)).filter(
+      (entry) => entry.kind === AuditKind.CAPABILITY_ACTIVATION_FAILED,
+    );
+    expect(failures).toHaveLength(1); // terminal disposition recorded exactly once
+    const info = failures[0]?.capability;
+    expect(info).not.toBeNull();
+    expect(info?.capabilityId).toBe(IDP_ID);
+    expect(info?.error ?? '').toContain('no creds');
+    expect(failures[0]?.epoch).toBe(result.epoch); // epoch-stamped like every other audit entry
+  });
+
+  it('isolates a rate-limit wait cut short by the per-operation timeout and skips its audit', async () => {
+    // S1: a capability action paces at the audited seam BEFORE recording. When the fleet limiter wait
+    // genuinely outlasts the per-operator timeout, the bound cuts the operator off mid-acquire: the
+    // failure is isolated (the session still COMPLETES + aggregates), and because pacing precedes
+    // recording, the cut-short-before-proceeding action leaves NO audit entry — the trail holds only
+    // actions that got past the limiter.
+    //
+    // Python blocks on an `asyncio.Event` that is never set and lets task cancellation raise into the
+    // await; a promise cannot be cancelled, so the port blocks on a `Deferred` that is never resolved
+    // — the wait genuinely never returns, which is what the bound is there to survive.
+    const blocked = new Deferred<void>(); // never resolved → the limiter wait blocks until the bound fires
+
+    class BlockingLimiter implements RateLimiter {
+      public async acquire(_key: string): Promise<void> {
+        await blocked.promise;
+      }
+    }
+
+    @capability
+    class Idp extends Capability {
+      public static readonly capabilityId = IDP_ID;
+      public static readonly dependsOn = [EmailDataPoint];
+
+      public async activate(_ctx: CapabilityContext): Promise<void> {
+        return;
+      }
+
+      public async callOut(): Promise<string> {
+        return 'ok';
+      }
+    }
+
+    class Caller extends Operator {
+      public static readonly operatorId = OperatorId('caller');
+      public static readonly policy = OperatorPolicy({ rerunOnNewData: false });
+      public static readonly dependsOn = [EmailDataPoint];
+      public static readonly requires = [Idp];
+      public static readonly produces = [ChatAnswerDataPoint];
+
+      public async *run(ctx: OperatorContext): AsyncIterable<DataPointEmission> {
+        const idp = ctx.capabilities.require(Idp);
+        const answer = await idp.callOut(); // blocks in the limiter wait until the per-op bound fires
+        yield ChatAnswerDataPoint.emit(answer);
+      }
+    }
+    operator(Caller);
+
+    const session = SessionId('cap-rl-session');
+    const catalog = new InMemoryCapabilityCatalog({ permitted: [[NAMESPACE, [IDP_ID]]] });
+    const runtime = buildInMemoryRuntime(new FakeClock(), { catalog, rateLimiter: new BlockingLimiter() });
+
+    const result = await new Orchestrator({
+      sessionId: session,
+      namespaceId: NAMESPACE,
+      runtime,
+      operators: [Caller],
+      capabilities: [Idp],
+      seed: [workEmail()],
+      operationTimeoutMs: 20, // real-time bound; the limiter wait never returns, so the bound cuts it off
+    }).run();
+
+    expect(result.status).toBe(SessionStatus.COMPLETED); // the cut-short action is isolated; the session finishes
+    const invoked = (await runtime.audit.replay(session)).filter(
+      (entry) => entry.kind === AuditKind.CAPABILITY_INVOKED,
+    );
+    expect(invoked).toEqual([]); // paced-then-audited: cut off before proceeding → never recorded
+  });
+
+  it('paces a rate-limited action inside a run, then proceeds and audits it', async () => {
+    // The companion to the previous case: when the fleet limiter wait DOES complete (it only paces,
+    // never fails), the deterministic FakeClock-driven InMemoryRateLimiter sleep is fast-forwarded,
+    // the action proceeds, and exactly one audit entry is recorded. A second action on the same
+    // bucket waits out the refill — but still proceeds and audits, because the limiter waits, it
+    // never fails.
+    const clock = new FakeClock();
+
+    @capability
+    class Idp extends Capability {
+      public static readonly capabilityId = IDP_ID;
+      public static readonly dependsOn = [EmailDataPoint];
+
+      public async activate(_ctx: CapabilityContext): Promise<void> {
+        return;
+      }
+
+      public async callOut(options: { readonly marker: string }): Promise<string> {
+        return options.marker;
+      }
+    }
+
+    class Caller extends Operator {
+      public static readonly operatorId = OperatorId('caller');
+      public static readonly policy = OperatorPolicy({ rerunOnNewData: false });
+      public static readonly dependsOn = [EmailDataPoint];
+      public static readonly requires = [Idp];
+      public static readonly produces = [ChatAnswerDataPoint];
+
+      public async *run(ctx: OperatorContext): AsyncIterable<DataPointEmission> {
+        const idp = ctx.capabilities.require(Idp);
+        yield ChatAnswerDataPoint.emit(await idp.callOut({ marker: 'first' })); // consumes the burst token
+        yield ChatAnswerDataPoint.emit(await idp.callOut({ marker: 'second' })); // waits out the refill
+      }
+    }
+    operator(Caller);
+
+    const session = SessionId('cap-rl-pace-session');
+    const catalog = new InMemoryCapabilityCatalog({ permitted: [[NAMESPACE, [IDP_ID]]] });
+    // The second acquire sleeps ~10 s on the clock.
+    const limiter = new InMemoryRateLimiter(clock, { ratePerSecond: 0.1, burst: 1 });
+    const runtime = buildInMemoryRuntime(clock, { catalog, rateLimiter: limiter });
+    const startedAt = clock.monotonic();
+
+    const result = await new Orchestrator({
+      sessionId: session,
+      namespaceId: NAMESPACE,
+      runtime,
+      operators: [Caller],
+      capabilities: [Idp],
+      seed: [workEmail()],
+      sessionDeadlineMs: 300_000, // ample budget; the limiter sleep is fast-forwarded on the FakeClock
+    }).run();
+
+    expect(result.status).toBe(SessionStatus.COMPLETED);
+    const answers = new Set(
+      (await runtime.store.snapshot(session)).ofType(ChatAnswerDataPoint).map((dataPoint) => dataPoint.value),
+    );
+    expect(answers).toEqual(new Set(['first', 'second'])); // both paced actions proceeded — the limiter waited
+    // The second acquire genuinely WAITED (it did not drop or skip): the burst was one token, so
+    // refilling one at 0.1/s fast-forwards the injected clock ~10 s — observable proof of the pacing.
+    expect(clock.monotonic() - startedAt).toBeGreaterThanOrEqual(9_000);
+    const invoked = (await runtime.audit.replay(session)).filter(
+      (entry) => entry.kind === AuditKind.CAPABILITY_INVOKED,
+    );
+    expect(invoked).toHaveLength(2); // exactly the two actions that got past the limiter are in the trail
   });
 });

@@ -9,6 +9,7 @@
 
 export { BoundedQueue } from './bounded_queue.js';
 export { Deferred } from './deferred.js';
+export { pythonFloatRepr, pythonRepr, pythonStrRepr } from './python_repr.js';
 export {
   type ManagedRegistry,
   type RegistriesSnapshot,
@@ -18,5 +19,5 @@ export {
   restoreAllRegistries,
   snapshotAllRegistries,
 } from './registry.js';
-export { canonicalValue, stableStringify } from './stable_json.js';
+export { stableStringify } from './stable_json.js';
 export { OperationTimeoutError, withTimeout } from './timeouts.js';

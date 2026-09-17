@@ -12,15 +12,18 @@ import { createHash } from 'node:crypto';
 import { describe, expect, it } from 'vitest';
 import { foldIn } from '../src/orcastork/adapters/memory/datapoint_archive.js';
 import { InMemoryDataPointArchive } from '../src/orcastork/adapters/memory/index.js';
-import { ArchivedDataPoint, valueHash } from '../src/orcastork/archive/index.js';
+import { ArchivedDataPoint, unseal, valueHash } from '../src/orcastork/archive/index.js';
 import type { AnyDataPoint } from '../src/orcastork/datapoints/index.js';
 import { canonicalValue } from '../src/orcastork/datapoints/index.js';
 import { Epoch, OperatorId, SessionId } from '../src/orcastork/ids.js';
+import { Orchestrator } from '../src/orcastork/orchestrator/index.js';
+import { buildInMemoryRuntime } from '../src/orcastork/runtime.js';
 import { ReversingCipher } from './doubles/cipher.js';
 import { FakeClock } from './doubles/clock.js';
 import { describeDataPointArchiveConformance } from './doubles/conformance/datapoint_archive.js';
 import { NAMESPACE, SID, T2 } from './doubles/conformance/shared.js';
-import { risk, T0, workEmail } from './doubles/datapoints.js';
+import { RiskDataPoint, risk, T0, TriggerDataPoint, workEmail } from './doubles/datapoints.js';
+import { makeOperator } from './doubles/operators.js';
 
 describeDataPointArchiveConformance({
   name: 'InMemoryDataPointArchive',
@@ -144,8 +147,36 @@ describe('the in-memory archive cipher seam', () => {
     expect(afterRedelivery[0]?.value).toEqual(value);
     expect(afterRedelivery[0]?.lastRetrieved).toEqual(T2);
   });
-});
 
+  it('unseals a value another build sealed with a spaced JSON serializer', async () => {
+    // Cross-serializer durability: a PII value sealed by a build that serialized with Python's
+    // stdlib json (spaced separators like {"a": 1}) must still unseal here, where the compact
+    // serializer is what writes. Hand-build the sealed entry with the spacing made explicit.
+    const cipher = new ReversingCipher();
+    const original = { a: 1, b: 2 };
+    const spaced = `{${Object.entries(original)
+      .map(([key, value]) => `${JSON.stringify(key)}: ${value}`)
+      .join(', ')}}`;
+    // The spaced stdlib form, not the compact one ({"a":1,...}).
+    expect(spaced).toContain(', ');
+    expect(spaced).toContain(': ');
+    const sealed = new ArchivedDataPoint({
+      sessionId: SID,
+      namespaceId: NAMESPACE,
+      type: 'geo_pii',
+      value: cipher.encrypt(spaced), // what an older stdlib-json build would have stored at rest
+      retrievedBy: OperatorId('collector'),
+      firstRetrieved: T0,
+      lastRetrieved: T0,
+      isPii: true,
+      epoch: Epoch(1),
+    });
+
+    const recovered = unseal(sealed, cipher);
+
+    expect(recovered.value).toEqual(original); // the JSON read tolerated the spaced stdlib form
+  });
+});
 describe('the in-memory archive retention window', () => {
   it('expires an archived document on schedule', async () => {
     const clock = new FakeClock();
@@ -179,5 +210,42 @@ describe('the in-memory keyed-upsert fold', () => {
     expect(merged).toHaveLength(1);
     expect(merged[0]?.epoch).toBe(2); // not 1 — the out-of-order arrival does not lower it
     expect(merged[0]?.lastRetrieved).toEqual(T2); // nor does it walk the timestamp back
+  });
+});
+
+describe('the orchestrator as an archive writer', () => {
+  it('never archives an ephemeral DataPoint', async () => {
+    const runtime = buildInMemoryRuntime(new FakeClock());
+    const emitter = makeOperator('op', {
+      produces: [RiskDataPoint, TriggerDataPoint],
+      emits: [RiskDataPoint.emit(0.7), TriggerDataPoint.emit('go')],
+    });
+
+    await new Orchestrator({ sessionId: SID, namespaceId: NAMESPACE, runtime, operators: [emitter] }).run();
+
+    const archivedTypes = new Set((await runtime.archive.read(SID)).map((entry) => entry.type));
+    expect(archivedTypes.has('risk')).toBe(true); // non-ephemeral is archived
+    expect(archivedTypes.has('trigger')).toBe(false); // ephemeral is never archived, on either durable path
+  });
+
+  it('live-archives every merge and stamps its provenance, namespace and epoch', async () => {
+    const runtime = buildInMemoryRuntime(new FakeClock());
+    const emitter = makeOperator('op', { produces: [RiskDataPoint], emits: [RiskDataPoint.emit(0.7)] });
+
+    const result = await new Orchestrator({
+      sessionId: SID,
+      namespaceId: NAMESPACE,
+      runtime,
+      operators: [emitter],
+      seed: [workEmail()],
+    }).run();
+
+    const archivedByType = new Map((await runtime.archive.read(SID)).map((entry) => [entry.type, entry]));
+    // The seed and the emission are both live-archived and flushed.
+    expect([...archivedByType.keys()].sort()).toEqual(['risk', 'work_email']);
+    expect(archivedByType.get('risk')?.value).toBe(0.7);
+    expect(archivedByType.get('risk')?.epoch).toBe(result.epoch); // epoch-stamped by the writer
+    expect(archivedByType.get('risk')?.retrievedBy).toBe(OperatorId('op')); // provenance stamped by the orchestrator
+    expect(archivedByType.get('work_email')?.namespaceId).toBe(NAMESPACE);
   });
 });

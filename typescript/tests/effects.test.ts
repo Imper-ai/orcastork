@@ -7,10 +7,8 @@
  * that claimed it failed (the claim is reverted, so a retry is not silently skipped), and applies an
  * explicit recovery policy when a predecessor died mid-effect.
  *
- * The session-level cases (an effect surviving data-driven reruns, a crash-resume, an aggregator's
- * context) need the orchestrator and are ported with it; the Python originals are
- * `test_fx_01` … `test_fx_06`. `test_fx_15` (a malformed pending mark reads as an unknown owner) is
- * a `ports/datapoint_store` unit and already lives in `tests/ports.test.ts`.
+ * `test_fx_15` (a malformed pending mark reads as an unknown owner) is a `ports/datapoint_store`
+ * unit and already lives in `tests/ports.test.ts`.
  *
  * The store is the in-memory `DataPointStore` adapter, as in Python: the guard's contract is
  * written against the effect keyspace, and the adapter is the reference implementation of it.
@@ -18,21 +16,38 @@
 
 import { describe, expect, it } from 'vitest';
 import { InMemoryDataPointStore } from '../src/orcastork/adapters/memory/index.js';
+import { RetryPolicy } from '../src/orcastork/aggregation/index.js';
+import type { DataPointEmission } from '../src/orcastork/datapoints/index.js';
 import { StaleEpochError } from '../src/orcastork/exceptions.js';
-import type { OperatorId, SessionId } from '../src/orcastork/ids.js';
-import { Epoch as toEpoch, OperatorId as toOperatorId, SessionId as toSessionId } from '../src/orcastork/ids.js';
-import { EffectGuard, EffectRecovery } from '../src/orcastork/operators/index.js';
+import type { NamespaceId, OperatorId, SessionId } from '../src/orcastork/ids.js';
+import {
+  Epoch as toEpoch,
+  NamespaceId as toNamespaceId,
+  OperatorId as toOperatorId,
+  SessionId as toSessionId,
+} from '../src/orcastork/ids.js';
+import type { OperatorContext } from '../src/orcastork/operators/index.js';
+import { EffectGuard, EffectRecovery, Operator, OperatorPolicy, operator } from '../src/orcastork/operators/index.js';
+import { Orchestrator, SessionStatus } from '../src/orcastork/orchestrator/index.js';
 import type {
   ClaimEffectOptions,
   DataPointStore,
   EffectClaim as EffectClaimValue,
 } from '../src/orcastork/ports/index.js';
 import { EffectClaim } from '../src/orcastork/ports/index.js';
+import { buildInMemoryRuntime } from '../src/orcastork/runtime.js';
+import { FakeClock } from './doubles/clock.js';
+import { EmailDataPoint, IpDataPoint, ip, RiskDataPoint, workEmail } from './doubles/datapoints.js';
 import { captureLogs } from './doubles/logs.js';
+import { makeAggregator } from './doubles/operators.js';
 
 const SID: SessionId = toSessionId('fx-session');
+const NAMESPACE: NamespaceId = toNamespaceId('fx-namespace');
 const OP: OperatorId = toOperatorId('fx-op');
 const KEY = `${OP}:send-otp`;
+
+/** The in-memory lock's TTL is 30 s, so this is a predecessor lease that has certainly lapsed. */
+const PAST_TTL_MS = 31_000;
 
 const guardOver = (store: DataPointStore, epoch = 1): EffectGuard =>
   new EffectGuard(store, { sessionId: SID, operatorId: OP, epoch: toEpoch(epoch) });
@@ -276,5 +291,258 @@ describe('the ctx.once effect guard', () => {
 
     expect(fired).toEqual([]); // the effect body did not run
     expect(await store.getEffectState(SID, KEY)).toBe('committed'); // the committed state stands
+  });
+});
+
+describe('a session guarding a side effect', () => {
+  it('fires the effect once across data-driven reruns', async () => {
+    const runtime = buildInMemoryRuntime(new FakeClock());
+    const fired: number[] = [];
+    let counter = 0;
+
+    class OtpSender extends Operator {
+      public static readonly operatorId = toOperatorId('otp_sender');
+      // A bounded self-cycle: each run's own emission re-triggers it, so it genuinely reruns.
+      public static readonly policy = OperatorPolicy({ rerunOnNewData: true, maxCycles: 3, debounceMs: 0 });
+      public static readonly dependsOn = [IpDataPoint];
+      public static readonly produces = [IpDataPoint];
+
+      public async *run(ctx: OperatorContext): AsyncIterable<DataPointEmission> {
+        await ctx.once('send-otp', (acquired) => {
+          if (acquired) {
+            fired.push(1);
+          }
+        });
+        yield IpDataPoint.emit(`ip-${counter}`);
+        counter += 1;
+      }
+    }
+    operator(OtpSender);
+
+    const result = await new Orchestrator({
+      sessionId: SID,
+      namespaceId: NAMESPACE,
+      runtime,
+      operators: [OtpSender],
+      seed: [ip('seed')],
+    }).run();
+
+    expect(result.status).toBe(SessionStatus.COMPLETED);
+    expect(result.operatorRuns.get(toOperatorId('otp_sender')) ?? 0).toBeGreaterThanOrEqual(2); // it really reran
+    expect(fired).toHaveLength(1); // but the OTP went out exactly once
+  });
+
+  it('does not re-fire a committed effect on a crash-resume', async () => {
+    const clock = new FakeClock();
+    const runtime = buildInMemoryRuntime(clock);
+    const fired: number[] = [];
+
+    class OtpSender extends Operator {
+      public static readonly operatorId = toOperatorId('otp_sender');
+      public static readonly policy = OperatorPolicy({ rerunOnNewData: false });
+      public static readonly dependsOn = [EmailDataPoint];
+      public static readonly produces = [RiskDataPoint];
+
+      public async *run(ctx: OperatorContext): AsyncIterable<DataPointEmission> {
+        await ctx.once('send-otp', (acquired) => {
+          if (acquired) {
+            fired.push(1);
+          }
+        });
+        yield RiskDataPoint.emit(0.5);
+      }
+    }
+    operator(OtpSender);
+
+    // The predecessor seeded the store and its operator ran the effect to completion (the durable
+    // commit landed), then the pod died before the watermark write — a successor re-runs the
+    // operator from scratch.
+    const epoch = await runtime.lock.acquire(SID);
+    await runtime.store.write(SID, [workEmail()], { epoch });
+    const claim = await runtime.store.claimEffect(SID, 'otp_sender:send-otp', { epoch, reclaimStale: false });
+    expect(claim).toBe(EffectClaim.ACQUIRED);
+    await runtime.store.commitEffect(SID, 'otp_sender:send-otp', { epoch });
+    clock.advance(PAST_TTL_MS); // the predecessor's lease expires
+
+    const result = await new Orchestrator({
+      sessionId: SID,
+      namespaceId: NAMESPACE,
+      runtime,
+      operators: [OtpSender],
+    }).run();
+
+    expect(result.status).toBe(SessionStatus.COMPLETED);
+    expect(result.operatorRuns.get(toOperatorId('otp_sender'))).toBe(1); // the successor re-drove the operator
+    expect(fired).toEqual([]); // but the committed claim stopped the OTP from re-firing
+  });
+
+  it('namespaces the same effect key per operator', async () => {
+    const runtime = buildInMemoryRuntime(new FakeClock());
+    const fired: string[] = [];
+
+    class FirstNotifier extends Operator {
+      public static readonly operatorId = toOperatorId('first_notifier');
+      public static readonly policy = OperatorPolicy({ rerunOnNewData: false });
+      public static readonly dependsOn = [EmailDataPoint];
+      public static readonly produces = [IpDataPoint];
+
+      public async *run(ctx: OperatorContext): AsyncIterable<DataPointEmission> {
+        await ctx.once('notify', (acquired) => {
+          if (acquired) {
+            fired.push('first');
+          }
+        });
+        yield IpDataPoint.emit('203.0.113.7');
+      }
+    }
+    operator(FirstNotifier);
+
+    class SecondNotifier extends Operator {
+      public static readonly operatorId = toOperatorId('second_notifier');
+      public static readonly policy = OperatorPolicy({ rerunOnNewData: false });
+      public static readonly dependsOn = [EmailDataPoint];
+      public static readonly produces = [RiskDataPoint];
+
+      public async *run(ctx: OperatorContext): AsyncIterable<DataPointEmission> {
+        await ctx.once('notify', (acquired) => {
+          if (acquired) {
+            fired.push('second');
+          }
+        });
+        yield RiskDataPoint.emit(0.5);
+      }
+    }
+    operator(SecondNotifier);
+
+    const result = await new Orchestrator({
+      sessionId: SID,
+      namespaceId: NAMESPACE,
+      runtime,
+      operators: [FirstNotifier, SecondNotifier],
+      seed: [workEmail()],
+    }).run();
+
+    expect(result.status).toBe(SessionStatus.COMPLETED);
+    expect([...fired].sort()).toEqual(['first', 'second']); // the shared key never collided across operators
+  });
+
+  it('exposes the effect guard on an aggregator context', async () => {
+    const runtime = buildInMemoryRuntime(new FakeClock());
+    const outcomes: boolean[] = [];
+
+    const reporter = makeAggregator('rep', {
+      dependsOn: [EmailDataPoint],
+      onAggregate: async (ctx) => {
+        await ctx.once('final-notification', (first) => {
+          outcomes.push(first);
+        });
+        await ctx.once('final-notification', (second) => {
+          outcomes.push(second);
+        });
+      },
+    });
+
+    const result = await new Orchestrator({
+      sessionId: SID,
+      namespaceId: NAMESPACE,
+      runtime,
+      operators: [reporter],
+      seed: [workEmail()],
+    }).run();
+
+    expect(result.status).toBe(SessionStatus.COMPLETED);
+    expect(outcomes).toEqual([true, false]); // claimed and committed once; the second claim deduped
+  });
+
+  it('reverts a failed effect attempt so the retry re-fires it', async () => {
+    // THE scenario motivating claim/commit/revert: the third-party call raises on attempt 1, so the
+    // operator attempt fails. A mark-before-run design would leave the mark in place and the
+    // loop-scheduled retry would SKIP the effect ("at most once, possibly zero"); the revert on the
+    // failing exit means the retry re-acquires and the effect actually happens exactly once overall.
+    const runtime = buildInMemoryRuntime(new FakeClock());
+    let attempts = 0;
+    const acquisitions: boolean[] = [];
+    const sends: number[] = [];
+
+    class OtpSender extends Operator {
+      public static readonly operatorId = toOperatorId('otp_sender');
+      public static readonly policy = OperatorPolicy({
+        rerunOnNewData: false,
+        retry: RetryPolicy({ maxAttempts: 2, baseDelayMs: 0 }),
+      });
+      public static readonly dependsOn = [EmailDataPoint];
+      public static readonly produces = [RiskDataPoint];
+
+      public async *run(ctx: OperatorContext): AsyncIterable<DataPointEmission> {
+        attempts += 1;
+        const attempt = attempts;
+        await ctx.once('send-otp', (acquired) => {
+          acquisitions.push(acquired);
+          if (acquired) {
+            if (attempt === 1) {
+              throw new Error('otp provider returned 503'); // the call failed: no OTP went out
+            }
+            sends.push(attempt);
+          }
+        });
+        yield RiskDataPoint.emit(0.5);
+      }
+    }
+    operator(OtpSender);
+
+    const result = await new Orchestrator({
+      sessionId: SID,
+      namespaceId: NAMESPACE,
+      runtime,
+      operators: [OtpSender],
+      seed: [workEmail()],
+    }).run();
+
+    expect(result.status).toBe(SessionStatus.COMPLETED);
+    expect(result.operatorRuns.get(toOperatorId('otp_sender'))).toBe(2); // the retry re-drove the operator
+    expect(acquisitions).toEqual([true, true]); // the failed attempt's claim was reverted, so it re-acquired
+    expect(sends).toEqual([2]); // and the OTP went out exactly once overall — on the attempt that succeeded
+    expect(await runtime.store.getEffectState(SID, 'otp_sender:send-otp')).toBe('committed');
+  });
+
+  it('re-runs a predecessor’s mid-effect crash on resume by default', async () => {
+    const clock = new FakeClock();
+    const runtime = buildInMemoryRuntime(clock);
+    const fired: number[] = [];
+
+    class OtpSender extends Operator {
+      public static readonly operatorId = toOperatorId('otp_sender');
+      public static readonly policy = OperatorPolicy({ rerunOnNewData: false });
+      public static readonly dependsOn = [EmailDataPoint];
+      public static readonly produces = [RiskDataPoint];
+
+      public async *run(ctx: OperatorContext): AsyncIterable<DataPointEmission> {
+        await ctx.once('send-otp', (acquired) => {
+          if (acquired) {
+            fired.push(1);
+          }
+        });
+        yield RiskDataPoint.emit(0.5);
+      }
+    }
+    operator(OtpSender);
+
+    // The predecessor claimed the effect and died mid-call — whether the OTP went out is unknowable.
+    const epoch = await runtime.lock.acquire(SID);
+    await runtime.store.write(SID, [workEmail()], { epoch });
+    const claim = await runtime.store.claimEffect(SID, 'otp_sender:send-otp', { epoch, reclaimStale: false });
+    expect(claim).toBe(EffectClaim.ACQUIRED);
+    clock.advance(PAST_TTL_MS); // the predecessor's lease expires
+
+    const { records, result } = await captureLogs(async () =>
+      new Orchestrator({ sessionId: SID, namespaceId: NAMESPACE, runtime, operators: [OtpSender] }).run(),
+    );
+
+    expect(result.status).toBe(SessionStatus.COMPLETED);
+    expect(fired).toEqual([1]); // the at-least-once default re-ran the unknown-outcome effect
+    const warning = records.find((record) => record.fields.effect_key === 'otp_sender:send-otp');
+    expect(warning).toBeDefined();
+    expect(warning?.level).toBe('WARNING');
+    expect(warning?.fields.stale_epoch).toBe(epoch); // the warning names the predecessor's epoch
   });
 });

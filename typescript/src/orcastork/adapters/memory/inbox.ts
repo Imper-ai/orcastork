@@ -49,12 +49,24 @@ class ArrivalEvent {
     this.signalled = false;
   }
 
-  public wait(): Promise<void> {
-    if (this.signalled) {
+  /**
+   * Wait for the next `set`, or for `signal` — a caller that gave the wait up drops out of the
+   * waiter list instead of sitting in it until some later append releases everyone.
+   */
+  public wait(signal?: AbortSignal): Promise<void> {
+    if (this.signalled || signal?.aborted === true) {
       return Promise.resolve();
     }
     const waiter = new Deferred<void>();
     this.waiters.push(waiter);
+    signal?.addEventListener(
+      'abort',
+      () => {
+        this.waiters = this.waiters.filter((parked) => parked !== waiter);
+        waiter.resolve();
+      },
+      { once: true },
+    );
     return waiter.promise;
   }
 }
@@ -227,7 +239,7 @@ export class InMemoryInbox implements Inbox {
     return this.stateOf(sessionId).messages.length;
   }
 
-  public async waitForEntry(sessionId: SessionId): Promise<void> {
+  public async waitForEntry(sessionId: SessionId, signal?: AbortSignal): Promise<void> {
     const state = this.stateOf(sessionId);
     if (state.messages.length > 0) {
       return; // entries already pending — never wait on data that is already here
@@ -236,6 +248,6 @@ export class InMemoryInbox implements Inbox {
     // append can never slip into that gap unobserved: it either landed above or it will set the
     // event we are about to wait on.
     state.arrival.clear();
-    await state.arrival.wait();
+    await state.arrival.wait(signal);
   }
 }

@@ -25,10 +25,23 @@
 import { z } from 'zod';
 import { DuplicateRegistrationError, InvalidDataPointError } from '../exceptions.js';
 import type { DataPointType, OperatorRef } from '../ids.js';
+import { pythonRepr } from '../internal/python_repr.js';
 import { Registry } from '../internal/registry.js';
-import { canonicalValue } from '../internal/stable_json.js';
 
-export { canonicalValue } from '../internal/stable_json.js';
+/**
+ * A process-stable canonical string for a JSON-native DataPoint value.
+ *
+ * Mirrors the keyed-merge identity normalization (`_make_hashable` — dict/set order insensitive),
+ * so a durable archive key built from it is stable across processes (Python's builtin `hash` is
+ * per-process salted). The archive adapter feeds this to `ValueCipher.mac` (PII — a keyed digest)
+ * or a plain SHA-256 (non-PII) to derive the key; the canonical form itself is never persisted for
+ * PII.
+ *
+ * It is Python's `repr(_make_hashable(value))`, byte for byte — see `internal/python_repr.ts` for
+ * why (the string is a Redis hash field and a digest input, so both runtimes must produce it
+ * identically) and for the two things a JavaScript number cannot tell us.
+ */
+export const canonicalValue = (value: unknown): string => pythonRepr(value);
 
 /**
  * Registry of concrete leaves keyed by discriminator value.
@@ -254,6 +267,10 @@ export abstract class BaseDataPoint<ValueT = unknown> {
    * normalization {@link canonicalValue} gives the archive key, so dedup decisions never diverge
    * across adapters.
    *
+   * Its shape — the discriminator, a NUL, and {@link canonicalValue} of the value — is exactly the
+   * Redis store's hash field (`f'{type}\x00{canonical_value(value)}'`), so a session written by a
+   * Python worker and one written here land on the same field.
+   *
    * Computed once, at construction: the instance is frozen, so the identity can never change, and
    * a value with no stable canonical form fails inside the emitting operator's fault boundary
    * rather than deep in the session state.
@@ -412,7 +429,8 @@ export class DataPointEmission<T extends AnyDataPoint = AnyDataPoint> {
  *
  * The single source of truth for "the same DataPoint": the in-memory store, the keyed-merge set
  * and the string-keyed contexts (Redis hash fields, the archive key) all key on this one canonical
- * string, so dedup decisions never diverge across adapters.
+ * string, so dedup decisions never diverge across adapters — or across runtimes, since
+ * {@link canonicalValue} is Python's `repr(_make_hashable(value))` byte for byte.
  */
 export const identityKey = (dataPoint: AnyDataPoint): string => dataPoint.identity;
 

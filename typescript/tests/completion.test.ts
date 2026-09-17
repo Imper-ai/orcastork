@@ -1,15 +1,14 @@
 /**
- * COMP — declarative completion conditions: the AST itself.
- *
- * The orchestrator-level wiring (a session that waits on the inbox until the condition is
- * satisfied) is ported with the orchestrator; the Python originals are
- * `test_comp_10_any_of_completes_when_either_branch_arrives` and
- * `test_comp_11_all_of_keeps_waiting_on_the_inbox_until_every_branch_is_present`.
+ * COMP — declarative completion conditions: the AST itself + the orchestrator-level wiring.
  */
 
 import { describe, expect, it } from 'vitest';
-import { DataPointView } from '../src/orcastork/datapoints/index.js';
+import type { AnyDataPoint } from '../src/orcastork/datapoints/index.js';
+import { DataPointSet, DataPointView } from '../src/orcastork/datapoints/index.js';
 import { InvalidCompletionConditionError } from '../src/orcastork/exceptions.js';
+import { NamespaceId, SessionId } from '../src/orcastork/ids.js';
+import { Orchestrator, SessionStatus } from '../src/orcastork/orchestrator/index.js';
+import { buildInMemoryRuntime } from '../src/orcastork/runtime.js';
 import type { CompletionCondition, CompletionItem } from '../src/orcastork/scheduling/index.js';
 import {
   AllOf,
@@ -20,6 +19,7 @@ import {
   normalizeCompletion,
   TypePresent,
 } from '../src/orcastork/scheduling/index.js';
+import { FakeClock } from './doubles/clock.js';
 import {
   ChatAnswerDataPoint,
   chatAnswer,
@@ -30,6 +30,25 @@ import {
   risk,
   workEmail,
 } from './doubles/datapoints.js';
+
+const SID = SessionId('comp-session');
+const NAMESPACE = NamespaceId('comp-namespace');
+
+/** The session deadline default, in the milliseconds the port counts in. */
+const DEFAULT_DEADLINE_MS = 300_000;
+
+/** Hand the event loop back once — the port of the Python helpers' `await asyncio.sleep(0)`. */
+const yieldOnce = (): Promise<void> =>
+  new Promise<void>((resolve) => {
+    setImmediate(resolve);
+  });
+
+/** Yield `times` times, the port of the Python helper's `for _ in range(n): await asyncio.sleep(0)`. */
+const yieldTimes = async (times: number): Promise<void> => {
+  for (let index = 0; index < times; index += 1) {
+    await yieldOnce();
+  }
+};
 
 describe('the completion AST', () => {
   it('satisfies TypePresent only when an instance of the type is present', () => {
@@ -110,5 +129,68 @@ describe('the completion AST', () => {
     expect(text).not.toContain('class'); // no class-object source text
     expect(text).not.toContain('=>');
     expect(describeCondition(new CustomCondition())).toBe(text); // process-stable: independent of instance identity
+  });
+});
+
+// --- orchestrator-level wiring ----------------------------------------------------------
+
+describe('a session driven by a completion condition', () => {
+  it.each<{ readonly branch: string; readonly arrival: () => AnyDataPoint }>([
+    { branch: 'the chat answer', arrival: () => chatAnswer('it was me') },
+    { branch: 'the ip', arrival: () => ip('198.51.100.7') },
+  ])('completes an anyOf as soon as $branch arrives', async ({ arrival }) => {
+    // A "verdict OR user-abandoned" flow: whichever of the two types lands first completes it.
+    const clock = new FakeClock();
+    const runtime = buildInMemoryRuntime(clock);
+    const arrived = arrival();
+
+    const userActs = async (): Promise<void> => {
+      await yieldTimes(5); // give the session time to reach the inbox wait
+      await runtime.inbox.append(SID, arrived);
+    };
+
+    const orchestrator = new Orchestrator({
+      sessionId: SID,
+      namespaceId: NAMESPACE,
+      runtime,
+      operators: [],
+      seed: [workEmail()],
+      completesWhen: anyOf(ChatAnswerDataPoint, IpDataPoint),
+    });
+    const [result] = await Promise.all([orchestrator.run(), userActs()]);
+
+    expect(result.status).toBe(SessionStatus.COMPLETED);
+    expect(new DataPointSet((await runtime.store.snapshot(SID)).all()).has(arrived)).toBe(true); // folded in
+    expect(clock.monotonic()).toBeLessThan(DEFAULT_DEADLINE_MS); // one branch satisfied it — no wait to the deadline
+  });
+
+  it('keeps waiting on the inbox for an allOf until every branch is present', async () => {
+    const clock = new FakeClock();
+    const runtime = buildInMemoryRuntime(clock);
+
+    const userActs = async (): Promise<void> => {
+      await yieldTimes(5); // give the session time to reach the inbox wait
+      await runtime.inbox.append(SID, chatAnswer('first'));
+      await yieldTimes(10); // let the session apply the entry and re-evaluate completion
+      expect(await runtime.lock.isComplete(SID)).toBe(false); // one of two branches present → still waiting
+      await runtime.inbox.append(SID, ip('198.51.100.7'));
+    };
+
+    const orchestrator = new Orchestrator({
+      sessionId: SID,
+      namespaceId: NAMESPACE,
+      runtime,
+      operators: [],
+      seed: [workEmail()],
+      completesWhen: allOf(ChatAnswerDataPoint, IpDataPoint),
+    });
+    const [result] = await Promise.all([orchestrator.run(), userActs()]);
+
+    expect(result.status).toBe(SessionStatus.COMPLETED);
+    const types = new Set((await runtime.store.snapshot(SID)).all().map((dataPoint) => dataPoint.type));
+    expect(types.has('chat_answer')).toBe(true); // both arrivals were folded in before completion
+    expect(types.has('ip')).toBe(true);
+    expect(await runtime.inbox.pendingCount(SID)).toBe(0); // both applied and acked
+    expect(clock.monotonic()).toBeLessThan(DEFAULT_DEADLINE_MS); // completed by satisfaction, not by the deadline
   });
 });

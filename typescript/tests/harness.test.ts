@@ -177,15 +177,16 @@ describe.each(PACKAGE_DIRECTORIES)('%s', (packageDirectory) => {
     expect(offenders).toEqual([]);
   });
 
-  it('lets nothing but runtime.ts and the adapters themselves import an adapter', () => {
-    // Core depends on `ports/` only; `runtime.ts` is the single seam that wires a concrete
+  it('lets nothing but the wiring seams and the adapters themselves import an adapter', () => {
+    // Core depends on `ports/` only; the wiring seams are the only modules that name a concrete
     // backend, so a core module reaching for `adapters/` is the ports/adapters boundary breaking
     // from the inside — which the dependency guard above cannot see, because an adapter is a
-    // relative import.
+    // relative import. `runtime.ts` is the one seam of both packages; `replay.ts` is the second of
+    // `orcastork`, because a replay always runs on a fresh, isolated in-memory substrate.
     const adaptersRoot = join('src', packageDirectory, 'adapters');
-    const wiringModule = join('src', packageDirectory, 'runtime.ts');
+    const wiringModules = new Set(['runtime.ts', 'replay.ts'].map((name) => join('src', packageDirectory, name)));
     const offenders = allImports(packageDirectory)
-      .filter((entry) => entry.file !== wiringModule && !entry.file.startsWith(adaptersRoot))
+      .filter((entry) => !wiringModules.has(entry.file) && !entry.file.startsWith(adaptersRoot))
       .filter((entry) => isRelative(entry.specifier) && resolvedWithin(entry).split('/').includes('adapters'))
       .map(describeImport);
 

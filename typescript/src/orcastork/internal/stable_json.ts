@@ -1,11 +1,16 @@
 /**
- * Deterministic canonical encoding of a value — the port's `_make_hashable` / `canonical_value`.
+ * Deterministic canonical **JSON** encoding of a value — the port's `orjson.dumps(OPT_SORT_KEYS)`.
  *
  * Python keys a DataPoint's identity on a hashable normalization of its value: lists and sets
  * become tuples, dicts become sorted key/value tuples. TypeScript has no structural hashing and
  * no hashable protocol, so the same job is done by a **canonical string**: two values that Python
  * would consider the same identity encode to the same string here, and a `Map` or `Set` keyed on
  * that string dedups exactly as Python's dict does.
+ *
+ * A DataPoint's own identity is **not** this function: `canonical_value` is literally
+ * `repr(_make_hashable(value))` in Python and reaches the wire, so `./python_repr.ts` reproduces
+ * that instead. What is left here is every caller that wants a stable *JSON* string — a fingerprint,
+ * a digest input, a cache key — where nothing on the other side is reading Python's `repr`.
  *
  * The encoding is JSON for JSON-native values, with three deliberate departures, each of which
  * exists to keep an identity from silently colliding:
@@ -35,16 +40,6 @@ import { UnstableValueError } from '../exceptions.js';
  * worker running the same flow.
  */
 export const stableStringify = (value: unknown): string => encode(value, new Set<object>());
-
-/**
- * A process-stable canonical string for a JSON-native DataPoint value.
- *
- * Mirrors the keyed-merge identity normalization (dict/set order insensitive), so a durable
- * archive key built from it is stable across processes. The archive adapter feeds this to
- * `ValueCipher.mac` (PII — a keyed digest) or a plain SHA-256 (non-PII) to derive the key; the
- * canonical form itself is never persisted for PII.
- */
-export const canonicalValue = (value: unknown): string => stableStringify(value);
 
 const encode = (value: unknown, seen: Set<object>): string => {
   switch (typeof value) {

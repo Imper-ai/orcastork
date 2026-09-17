@@ -87,7 +87,7 @@ export {
   type InvocationAuditor,
   type OnTerminalFailure,
 } from './capabilities/index.js';
-export { type Clock, SystemClock } from './clock.js';
+export { type Clock, SleepAbortedError, SystemClock } from './clock.js';
 export {
   type AnyClass,
   type AnyDataPoint,
@@ -168,8 +168,26 @@ export {
   Revision,
   SessionId,
 } from './ids.js';
+export {
+  type DescribeSessionOptions,
+  describeSession,
+  type OperatorState,
+  renderText,
+  type SessionDescription,
+} from './introspection.js';
 export { ConsoleJsonLogger, getLogger, type LogFields, type Logger, type LogLevel, setLogger } from './logging.js';
 export { attachOtelLogBridge, detachOtelLogBridge, isOtelLogBridgeAttached } from './logging_bridge.js';
+export {
+  DEFAULT_REDELIVERY_RECHECK_MS,
+  type DeliverOptions,
+  MAX_BACKSTOP_RESPAWNS,
+  type Redrive,
+  type ResumeOptions,
+  SchedulingGate,
+  SessionOrchestrationManager,
+  type SessionOrchestrationManagerOptions,
+  type StartSessionOptions,
+} from './manager/index.js';
 export {
   Aggregator,
   type AggregatorClass,
@@ -195,6 +213,21 @@ export {
   operator,
   RerunOn,
 } from './operators/index.js';
+export {
+  DEFAULT_EMISSION_QUEUE_SIZE,
+  DEFAULT_LEASE_RENEW_INTERVAL_MS,
+  DEFAULT_MAX_INBOX_DELIVERIES,
+  DEFAULT_OPERATION_TIMEOUT_MS,
+  DEFAULT_SESSION_DEADLINE_MS,
+  type DeadLetter,
+  type MirrorWriteResult,
+  Orchestrator,
+  type OrchestratorOptions,
+  type OrchestratorResult,
+  SessionStateMirror,
+  SessionStatus,
+  type Signal,
+} from './orchestrator/index.js';
 export {
   type ApplyResolvedOptions,
   type AuditSink,
@@ -229,6 +262,7 @@ export {
   VersionedDocument,
   type VersionedDocumentInit,
 } from './ports/index.js';
+export { type ReplayResult, type ReplaySessionOptions, replaySession } from './replay.js';
 export { buildInMemoryRuntime, OrchestratorRuntime, type OrchestratorRuntimeInit } from './runtime.js';
 export {
   AllOf,

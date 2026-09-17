@@ -38,6 +38,7 @@
     }
   },
   "bin": {
+    "orcastork-graph": "./dist/orcastork/tools/cli.js",
     "orcastork-lite-graph": "./dist/orcastork_lite/tools/cli.js"
   },
   "files": [

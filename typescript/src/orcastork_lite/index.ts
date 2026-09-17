@@ -31,7 +31,7 @@ export {
   InMemoryCapabilityCatalog,
   type InMemoryCapabilityCatalogInit,
 } from './capabilities.js';
-export { type Clock, SystemClock } from './clock.js';
+export { type Clock, SleepAbortedError, SystemClock } from './clock.js';
 export {
   type AnyClass,
   type AnyDataPoint,

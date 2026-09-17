@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
+import { canonicalValue } from '../../src/orcastork/datapoints/index.js';
 import { UnstableValueError } from '../../src/orcastork/exceptions.js';
-import { canonicalValue, stableStringify } from '../../src/orcastork/internal/stable_json.js';
+import { stableStringify } from '../../src/orcastork/internal/stable_json.js';
 
 describe('stableStringify', () => {
   it('sorts object keys so declaration order cannot change an identity', () => {
@@ -92,7 +93,14 @@ describe('stableStringify', () => {
 });
 
 describe('canonicalValue', () => {
-  it('is the same canonical string, under the name the archive key derivation uses', () => {
-    expect(canonicalValue({ b: 1, a: 2 })).toBe(stableStringify({ b: 1, a: 2 }));
+  it('is Python repr and not this JSON, because the canonical value reaches the wire', () => {
+    // `canonical_value` is `repr(_make_hashable(value))` in Python, and that string is a Redis hash
+    // field and a digest input — so it lives in `internal/python_repr.ts` (pinned against CPython
+    // in `python_repr.test.ts`), and this module is only the stable *JSON* every other caller
+    // wants. The two must not be confused for one another again.
+    expect(canonicalValue({ b: 1, a: 2 })).toBe("(('a', 2), ('b', 1))");
+    expect(canonicalValue({ b: 1, a: 2 })).not.toBe(stableStringify({ b: 1, a: 2 }));
+    // What the two do share is order insensitivity: neither may let key order split an identity.
+    expect(canonicalValue({ a: 2, b: 1 })).toBe(canonicalValue({ b: 1, a: 2 }));
   });
 });

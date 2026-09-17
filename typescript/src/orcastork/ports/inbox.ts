@@ -86,6 +86,12 @@ export interface Inbox {
    * wake it, and entries already pending when it is called return it immediately (implementations
    * subscribe before checking, closing the race). Returning claims nothing — callers still drain
    * via consume/reclaim/ack.
+   *
+   * `signal` is how a caller that stopped waiting gives the wait up, the way Python cancels the
+   * task it raced. An implementation MUST release everything the wait holds when it fires — a
+   * pub/sub connection above all — and then return: an abandoned promise never settles, so a
+   * teardown that only runs when the wait ends would leak one connection per parked session.
+   * Returning on an abort is a spurious wakeup, which this contract already allows.
    */
-  waitForEntry(sessionId: SessionId): Promise<void>;
+  waitForEntry(sessionId: SessionId, signal?: AbortSignal): Promise<void>;
 }

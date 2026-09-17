@@ -41,8 +41,15 @@ export class FakeClock implements Clock, LiteClock {
     this.elapsedMs += ms;
   }
 
-  /** Deterministic sleep: fast-forward the clock instead of waiting on the wall clock. */
-  public async sleep(ms: number): Promise<void> {
+  /**
+   * Deterministic sleep: fast-forward the clock instead of waiting on the wall clock.
+   *
+   * The abort signal is accepted and ignored on purpose. It exists so a caller that loses a race
+   * can drop a real timer a `SystemClock` would otherwise hold for the window's full width; this
+   * clock advances synchronously and has nothing pending to drop, so honouring the signal could
+   * only turn an already-finished wait into a spurious rejection.
+   */
+  public async sleep(ms: number, _signal?: AbortSignal): Promise<void> {
     this.advance(ms);
     // Yield once, so tasks running concurrently with the sleeper interleave — the counterpart of
     // the Python double's `await asyncio.sleep(0)`.

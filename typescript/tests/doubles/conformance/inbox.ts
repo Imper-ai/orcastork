@@ -37,12 +37,29 @@ const NEWER_DEPLOY_PAYLOAD = JSON.stringify({
  */
 const MALFORMED_KNOWN_TYPE_PAYLOAD = JSON.stringify({ type: 'work_email', value: 'a@work.example' });
 
+/**
+ * An entry id this inbox never issued, in the shape the default backend hands out.
+ *
+ * Overridden by a harness whose backend parses ids: a Redis stream id has a grammar, and `XACK`
+ * rejects a string that is not one outright rather than reporting "nothing acked".
+ */
+const UNKNOWN_ENTRY_ID = 'no-such-entry';
+
 /** The inbox under contract, plus the harness controls and the foreign-producer seam. */
 export interface InboxHarness extends ConformanceHarness {
   readonly inbox: Inbox;
 
   /** Append a raw wire payload the way a foreign producer would, returning its entry id. */
   readonly appendRaw: AppendRaw;
+
+  /**
+   * An entry id the backend could have issued but did not; {@link UNKNOWN_ENTRY_ID} by default.
+   *
+   * The id format belongs to the backend, exactly as the raw append does, so the contract asks the
+   * harness for one instead of fabricating a string. What is under contract is that acking an
+   * entry the inbox does not hold changes nothing — not that any string is accepted as an id.
+   */
+  readonly unknownEntryId?: string;
 }
 
 /** One inbox adapter bound to the contract. */
@@ -60,11 +77,13 @@ export const describeInboxConformance = (binding: InboxBinding): void => {
     let harness: InboxHarness;
     let inbox: Inbox;
     let appendRaw: AppendRaw;
+    let unknownEntryId: string;
 
     beforeEach(async () => {
       harness = await binding.create();
       inbox = harness.inbox;
       appendRaw = harness.appendRaw;
+      unknownEntryId = harness.unknownEntryId ?? UNKNOWN_ENTRY_ID;
     });
 
     afterEach(async () => {
@@ -109,7 +128,7 @@ export const describeInboxConformance = (binding: InboxBinding): void => {
     it('treats an ack of an unknown or already-acked entry as a no-op', async () => {
       const entryId = await inbox.append(SID, workEmail('a@e.example'));
       await inbox.consume(SID);
-      await inbox.ack(SID, 'no-such-entry', { epoch: Epoch(1) }); // unknown → no-op
+      await inbox.ack(SID, unknownEntryId, { epoch: Epoch(1) }); // unknown → no-op
       await inbox.ack(SID, entryId, { epoch: Epoch(1) });
       await inbox.ack(SID, entryId, { epoch: Epoch(1) }); // already acked → no-op
       expect(await inbox.pendingCount(SID)).toBe(0);
@@ -137,6 +156,28 @@ export const describeInboxConformance = (binding: InboxBinding): void => {
     it('returns from waitForEntry immediately when entries are already pending', async () => {
       await inbox.append(SID, workEmail('a@e.example'));
       await inbox.waitForEntry(SID); // already-pending entries never wait
+    });
+
+    it('ends a given-up waitForEntry so whatever it holds is released', async () => {
+      // The port of Python's `finally: waiter.cancel()`. A wait the orchestrator walked away from
+      // (a deadline, a park) must not sit there forever: an implementation releases what it holds —
+      // a pub/sub connection above all — only when its own await ends, so a promise that never
+      // settles is one leaked connection per parked session.
+      const abandon = new AbortController();
+      const waiter = inbox.waitForEntry(SID, abandon.signal);
+      await new Promise<void>((resolve) => {
+        setImmediate(resolve);
+      });
+      abandon.abort();
+      await waiter; // returns rather than hanging; the suite's own timeout is the safety net
+      // Giving the wait up claims nothing and disturbs nothing — a later append still delivers.
+      await inbox.append(SID, workEmail('a@e.example'));
+      expect(await inbox.consume(SID)).toHaveLength(1);
+    });
+
+    it('returns from a waitForEntry whose signal was already aborted', async () => {
+      await inbox.waitForEntry(SID, AbortSignal.abort()); // nothing was opened, nothing waits
+      expect(await inbox.pendingCount(SID)).toBe(0);
     });
 
     it('makes the redelivery count visible', async () => {
@@ -202,7 +243,7 @@ export const describeInboxConformance = (binding: InboxBinding): void => {
     it('guards quarantine by epoch', async () => {
       const entryId = await inbox.append(SID, workEmail('a@e.example'));
       await inbox.consume(SID);
-      await inbox.ack(SID, 'no-such-entry', { epoch: Epoch(2) }); // a successor has bumped the inbox epoch
+      await inbox.ack(SID, unknownEntryId, { epoch: Epoch(2) }); // a successor has bumped the inbox epoch
       await expect(
         inbox.quarantine(SID, entryId, { reason: 'from a fenced predecessor', epoch: Epoch(1) }),
       ).rejects.toThrow(StaleEpochError);

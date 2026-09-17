@@ -11,11 +11,20 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { LockHeldError, StaleEpochError } from '../../../src/orcastork/exceptions.js';
 import type { SessionLock } from '../../../src/orcastork/ports/index.js';
 import type { ConformanceBinding, ConformanceHarness } from './shared.js';
-import { OTHER_SID, SID } from './shared.js';
+import { DEFAULT_LEASE_MS, OTHER_SID, pastWindow, SID, withinWindow } from './shared.js';
 
 /** The lock under contract, plus the harness controls. */
 export interface LockHarness extends ConformanceHarness {
   readonly lock: SessionLock;
+
+  /**
+   * The lease TTL the adapter under test was configured with; {@link DEFAULT_LEASE_MS} by default.
+   *
+   * A backend that expires leases on a real server's clock cannot be fast-forwarded, so its binding
+   * configures a short lease and waits it out; every advance below is a multiple of this width, so
+   * the contract is the same either way.
+   */
+  readonly ttlMs?: number;
 }
 
 /** One session-lock adapter bound to the contract. */
@@ -26,10 +35,12 @@ export const describeLockConformance = (binding: LockBinding): void => {
   describe(binding.name, () => {
     let harness: LockHarness;
     let lock: SessionLock;
+    let ttlMs: number;
 
     beforeEach(async () => {
       harness = await binding.create();
       lock = harness.lock;
+      ttlMs = harness.ttlMs ?? DEFAULT_LEASE_MS;
     });
 
     afterEach(async () => {
@@ -44,7 +55,7 @@ export const describeLockConformance = (binding: LockBinding): void => {
 
     it('expires the lease after its TTL, letting a successor take over', async () => {
       await lock.acquire(SID);
-      await harness.advanceTime(31_000);
+      await harness.advanceTime(pastWindow(ttlMs));
       expect(await lock.isHeld(SID)).toBe(false);
       const second = await lock.acquire(SID); // a successor can take over
       expect(second).toBeGreaterThan(1);
@@ -52,9 +63,9 @@ export const describeLockConformance = (binding: LockBinding): void => {
 
     it('extends the lease on renew', async () => {
       const epoch = await lock.acquire(SID);
-      await harness.advanceTime(20_000);
+      await harness.advanceTime(withinWindow(ttlMs));
       await lock.renew(SID, { epoch });
-      await harness.advanceTime(20_000); // 40s total, but renewed at 20s
+      await harness.advanceTime(withinWindow(ttlMs)); // more than a full TTL in total, but renewed midway
       expect(await lock.isHeld(SID)).toBe(true);
     });
 
@@ -62,7 +73,7 @@ export const describeLockConformance = (binding: LockBinding): void => {
       const epochs: number[] = [];
       for (let grant = 0; grant < 3; grant += 1) {
         epochs.push(await lock.acquire(SID));
-        await harness.advanceTime(31_000); // let the lease expire so the next acquire succeeds
+        await harness.advanceTime(pastWindow(ttlMs)); // let the lease expire so the next acquire succeeds
       }
       expect(epochs).toEqual([...epochs].sort((left, right) => left - right));
       expect(new Set(epochs).size).toBe(3);
@@ -109,7 +120,7 @@ export const describeLockConformance = (binding: LockBinding): void => {
 
     it('fences completion against a takeover', async () => {
       const stale = await lock.acquire(SID);
-      await harness.advanceTime(31_000); // the predecessor's lease expires
+      await harness.advanceTime(pastWindow(ttlMs)); // the predecessor's lease expires
       await lock.acquire(SID); // a successor takes over, minting a higher epoch
       // The fenced predecessor cannot finalize.
       await expect(lock.markComplete(SID, { epoch: stale })).rejects.toThrow(StaleEpochError);

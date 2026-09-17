@@ -21,6 +21,7 @@ const HEADLINE_EXPORTS = [
   'Capability', // capabilities/
   'BaseDataPoint', // datapoints/
   'buildGraph', // graph/
+  'SessionOrchestrationManager', // manager/
   'Operator', // operators/
   'ChangeSet', // ports/
   'DebounceController', // scheduling/
@@ -28,8 +29,10 @@ const HEADLINE_EXPORTS = [
   'OrchestrationError', // exceptions.ts
   'FlowDefinition', // flow.ts
   'SessionId', // ids.ts
+  'describeSession', // introspection.ts
   'getLogger', // logging.ts
   'attachOtelLogBridge', // logging_bridge.ts
+  'replaySession', // replay.ts
   'buildInMemoryRuntime', // runtime.ts
   'Telemetry', // telemetry.ts
 ] as const;

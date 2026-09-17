@@ -541,7 +541,15 @@ export class Orchestrator {
     if (waitMs === null) {
       return (await queue.get()) ?? null;
     }
-    await Promise.race([queue.whenNotEmpty(), this.runtime.clock.sleep(waitMs)]);
+    // The loser of the race is abandoned, not left running: Python cancels the task it raced, and
+    // without the abort a signal that beat the window would leave a real timer pending for the
+    // window's full width on every pass.
+    const window = new AbortController();
+    try {
+      await Promise.race([queue.whenNotEmpty(), this.runtime.clock.sleep(waitMs, window.signal)]);
+    } finally {
+      window.abort();
+    }
     return queue.getNowait() ?? null;
   }
 
