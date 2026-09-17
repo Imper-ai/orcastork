@@ -7,11 +7,16 @@
     "dataflow",
     "blackboard",
     "workflow",
-    "ports-and-adapters"
+    "ports-and-adapters",
+    "scheduler",
+    "dag",
+    "resumable",
+    "typescript",
+    "esm"
   ],
   "license": "GPL-3.0-or-later",
   "author": "Imper.AI <contact@imper.ai>",
-  "homepage": "https://github.com/Imper-ai/orcastork",
+  "homepage": "https://github.com/Imper-ai/orcastork/tree/main/typescript#readme",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/Imper-ai/orcastork.git",
@@ -24,18 +29,39 @@
   "engines": {
     "node": ">=22"
   },
-  "sideEffects": false,
+  "sideEffects": true,
   "main": "./dist/orcastork/index.js",
   "types": "./dist/orcastork/index.d.ts",
   "exports": {
     ".": {
       "types": "./dist/orcastork/index.d.ts",
-      "default": "./dist/orcastork/index.js"
+      "import": "./dist/orcastork/index.js"
+    },
+    "./adapters/memory": {
+      "types": "./dist/orcastork/adapters/memory/index.d.ts",
+      "import": "./dist/orcastork/adapters/memory/index.js"
+    },
+    "./adapters/redis": {
+      "types": "./dist/orcastork/adapters/redis/index.d.ts",
+      "import": "./dist/orcastork/adapters/redis/index.js"
+    },
+    "./adapters/mongo": {
+      "types": "./dist/orcastork/adapters/mongo/index.d.ts",
+      "import": "./dist/orcastork/adapters/mongo/index.js"
     },
     "./lite": {
       "types": "./dist/orcastork_lite/index.d.ts",
-      "default": "./dist/orcastork_lite/index.js"
-    }
+      "import": "./dist/orcastork_lite/index.js"
+    },
+    "./lite/adapters/memory": {
+      "types": "./dist/orcastork_lite/adapters/memory.d.ts",
+      "import": "./dist/orcastork_lite/adapters/memory.js"
+    },
+    "./lite/adapters/redis": {
+      "types": "./dist/orcastork_lite/adapters/redis.d.ts",
+      "import": "./dist/orcastork_lite/adapters/redis.js"
+    },
+    "./package.json": "./package.json"
   },
   "bin": {
     "orcastork-graph": "./dist/orcastork/tools/cli.js",
@@ -46,6 +72,7 @@
   ],
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
+    "prepack": "npm run build",
     "typecheck": "tsc --noEmit",
     "lint": "biome check . && tsc --noEmit",
     "fix_lint": "biome check --write .",

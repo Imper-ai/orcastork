@@ -1,4 +1,4 @@
-.PHONY: deps lint fix_lint test test_integration test_all build clean
+.PHONY: deps lint fix_lint test test_integration test_all build pack clean
 
 # `npm ci` and not `npm install`: the lock file is the dependency list, and a build that
 # quietly resolves something else is not the build CI ran.
@@ -24,5 +24,11 @@ test_all: test test_integration
 build: deps
 	npm run build
 
+# The tarball a consumer actually installs, so what the `exports` map promises can be checked
+# against what is in the package. `npm pack` rebuilds through the `prepack` script first, so a
+# stale `dist` can never be published.
+pack: deps
+	npm pack
+
 clean:
-	rm -rf dist coverage node_modules
+	rm -rf dist coverage node_modules *.tgz

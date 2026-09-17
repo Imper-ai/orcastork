@@ -12,9 +12,6 @@ concurrency:
 
 env:
   NODE_VERSION: "22"
-  # Where mongodb-memory-server keeps the server binary it fetches. Named explicitly so the test
-  # job can cache one path instead of caching node_modules, which is where it would land by default.
-  MONGOMS_DOWNLOAD_DIR: ${{ github.workspace }}/.cache/mongodb-binaries
 
 defaults:
   run:
@@ -44,6 +41,10 @@ jobs:
 
   test:
     runs-on: ubuntu-latest
+    env:
+      # The binary is restored from the cache below, AFTER `npm ci` — which deletes node_modules,
+      # and the cache lives inside it. Letting the postinstall download would defeat the cache.
+      MONGOMS_DISABLE_POSTINSTALL: "1"
     steps:
       - uses: actions/checkout@v4
 
@@ -58,15 +59,16 @@ jobs:
       - name: Install redis-server
         run: sudo apt-get update && sudo apt-get install -y redis-server
 
-      # Restored before `npm ci`, whose postinstall is what fetches the binary.
-      - uses: actions/cache@v4
-        with:
-          path: ${{ env.MONGOMS_DOWNLOAD_DIR }}
-          key: mongodb-binaries-${{ runner.os }}-${{ hashFiles('typescript/package-lock.json') }}
-          restore-keys: mongodb-binaries-${{ runner.os }}-
-
       - name: Install dependencies
         run: npm ci
+
+      # Restored after `npm ci`, which wipes node_modules; on a miss the first Mongo suite
+      # downloads the binary here and the cache is written at the end of the job.
+      - uses: actions/cache@v4
+        with:
+          path: typescript/node_modules/.cache/mongodb-memory-server
+          key: mongodb-memory-server-${{ runner.os }}-${{ hashFiles('typescript/package-lock.json') }}
+          restore-keys: mongodb-memory-server-${{ runner.os }}-
 
       - name: The server helpers can actually start a server here
         run: npx vitest run tests/doubles/servers.test.ts
@@ -74,15 +76,42 @@ jobs:
       - name: vitest
         run: npm run test:coverage
 
-      - name: vitest -- integration
-        run: npm run test:integration
-
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: coverage-typescript
           path: typescript/coverage/
           if-no-files-found: ignore
+
+  integration:
+    runs-on: ubuntu-latest
+    env:
+      MONGOMS_DISABLE_POSTINSTALL: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: typescript/package-lock.json
+
+      # Same backing servers as the default suite: these are the slow and edge-case cases, not
+      # a different environment.
+      - name: Install redis-server
+        run: sudo apt-get update && sudo apt-get install -y redis-server
+
+      - name: Install dependencies
+        run: npm ci
+
+      - uses: actions/cache@v4
+        with:
+          path: typescript/node_modules/.cache/mongodb-memory-server
+          key: mongodb-memory-server-${{ runner.os }}-${{ hashFiles('typescript/package-lock.json') }}
+          restore-keys: mongodb-memory-server-${{ runner.os }}-
+
+      - name: vitest -- integration
+        run: npm run test:integration
 
   build:
     runs-on: ubuntu-latest
@@ -107,10 +136,54 @@ jobs:
       - name: The published tarball is what the exports map promises
         run: npm pack --dry-run
 
-      - name: The built entrypoints import from a clean Node process
+      # The real proof: pack, install into a throwaway project that has NEITHER optional peer,
+      # and import every subpath the exports map declares. Without those subpaths the adapters
+      # are unreachable — an `exports` map refuses the deep `dist/` import that would reach them,
+      # which the last assertion pins.
+      - name: The published tarball imports as a consumer gets it
         run: |
-          node --input-type=module -e "import('./dist/orcastork/index.js').then((m) => console.log(Object.keys(m)))"
-          node --input-type=module -e "import('./dist/orcastork_lite/index.js').then((m) => console.log(Object.keys(m)))"
+          set -euo pipefail
+          tarball="$RUNNER_TEMP/$(npm pack --pack-destination "$RUNNER_TEMP" --silent | tail -n 1)"
+          mkdir -p "$RUNNER_TEMP/smoke"
+          cd "$RUNNER_TEMP/smoke"
+          npm init -y > /dev/null
+          npm pkg set type=module
+          npm install "$tarball" --no-audit --no-fund
+          test ! -e node_modules/redis
+          test ! -e node_modules/mongodb
+          node --input-type=module <<'SMOKE'
+          const expected = {
+            orcastork: ['SessionOrchestrationManager', 'buildInMemoryRuntime', 'BaseDataPoint', 'Operator'],
+            'orcastork/lite': ['Orchestrator', 'DataPoint', 'Operator', 'buildRuntime'],
+            'orcastork/adapters/memory': ['InMemoryDataPointStore', 'InMemorySessionLock'],
+            'orcastork/adapters/redis': ['RedisDataPointStore', 'RedisStreamsInbox'],
+            'orcastork/adapters/mongo': ['MongoDurableStore', 'MongoDataPointArchive'],
+            'orcastork/lite/adapters/memory': ['InMemorySessionEventSink'],
+            'orcastork/lite/adapters/redis': ['RedisSessionEventSink'],
+          };
+          for (const [specifier, names] of Object.entries(expected)) {
+            const module = await import(specifier);
+            const missing = names.filter((name) => !(name in module));
+            if (missing.length > 0) {
+              throw new Error(`${specifier} is missing ${missing.join(', ')}`);
+            }
+            console.log(`ok    ${specifier}`);
+          }
+          await import('orcastork/dist/orcastork/index.js').then(
+            () => {
+              throw new Error('a deep dist import was allowed; the exports map is not gating reachability');
+            },
+            (error) => console.log(`ok    deep dist import refused: ${error.code}`),
+          );
+          SMOKE
+
+      # The console scripts are what downstream flows put in their own CI.
+      - name: The console scripts are installed and runnable
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/smoke"
+          npx orcastork-graph --help
+          npx orcastork-lite-graph --help
 
       - uses: actions/upload-artifact@v4
         with:
