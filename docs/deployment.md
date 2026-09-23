@@ -13,6 +13,7 @@ For what the framework *is* and how to write flows, start at the [README](../REA
 - [MongoDB: collections and indexes](#mongodb-collections-and-indexes)
 - [Timeouts: the one relationship you must not break](#timeouts-the-one-relationship-you-must-not-break)
 - [Running more than one process](#running-more-than-one-process)
+- [TypeScript workers](#typescript-workers)
 - [Telemetry exporters](#telemetry-exporters)
 - [Encryption](#encryption)
 - [Deploy-time graph validation](#deploy-time-graph-validation)
@@ -160,6 +161,64 @@ What each process must do:
 - **Call `resume` for orphaned sessions on some schedule.** A crashed or parked session is
   re-driven when someone asks; the manager does not poll on its own.
 
+## TypeScript workers
+
+The [TypeScript port](../typescript/README.md) is the same framework as an npm package, and it
+provisions **exactly the same infrastructure**: the Redis keyspace in the table above, key for key
+and Lua script for Lua script, and the Mongo collections in the table above, document shape for
+document shape. Everything on this page applies unchanged — the TTLs, the
+`ttl_ms > operation_timeout` rule, the index behaviour, the archive retention decision, the
+encryption story.
+
+So a **mixed deployment is the design goal**, verified so far by inspection against the Python
+source and by oracle checks (identical Lua scripts, keys, document shapes, canonical values,
+fingerprints) rather than by an end-to-end mixed-runtime run — rehearse it on a staging keyspace
+before relying on it. The intent: point Python processes and Node processes at the same Redis and
+the same MongoDB and let both call `resume`; the lock hands ownership to one, the epoch fences the
+others, and a session started by a Python worker is resumed, fed and finalized by a Node one (and
+the other way round). The flow fingerprint is the same digest in both runtimes,
+so a cross-runtime resume does not read as drift. Everything under *Running more than one process*
+above holds, plus one thing: both sides have to be running the **same flow**, so a rollout that
+changes a graph has to move both.
+
+Wiring a Node worker: the Redis adapters take a connected
+[node-redis](https://github.com/redis/node-redis) client and the Mongo adapters take a `Db` from the
+official [`mongodb`](https://www.mongodb.com/docs/drivers/node/current/) driver. Both are optional
+peer dependencies — install them only for the backends you use. The equivalent of
+`build_in_memory_runtime()` is `buildInMemoryRuntime()`, and a production runtime is assembled with
+`OrchestratorRuntime({...})`; see
+[the Ports & adapters section](../typescript/README.md#ports--adapters) for the full block.
+
+**One client setting matters, and it is not the default.** The Redis inbox's wakeup runs on a
+subscribed connection of its own, and a session that receives no input for a long time must not have
+its waiter die on the client's read deadline. Python keeps every read shorter than the deadline by
+polling the subscription on a 1-second interval; node-redis is push-driven and has no read to bound,
+so the adapter pings that connection on the same 1-second interval instead. node-redis is the
+stricter of the two: **it treats the read deadline as fatal and does not reconnect**, so nothing
+recovers a connection that was allowed to idle into it. Therefore:
+
+```ts
+const redis = await createClient({
+  url: process.env.REDIS_URL,
+  socket: { socketTimeout: 30_000 }, // >> the 1s keepalive; or leave it unset entirely
+}).connect();
+```
+
+A `socketTimeout` at or below one second strands every parked session on a dead subscription. The
+Python fleet's `RedisConfig.socket_timeout` is 30 s; matching it is the safe choice.
+
+The deploy-time graph check is the same idea under a different name: `orcastork-graph` (from the npm
+package's `bin`) for the core, `orcastork-lite-graph` for the lite one. Both take `-m` module
+specifiers — a Node worker points them at built `.js` files rather than dotted module names:
+
+```bash
+npx orcastork-graph -m ./dist/flows/operators.js -m ./dist/flows/capabilities.js --check
+```
+
+The same rule about imports applies: registration is a side effect of *defining* the class, so every
+module that defines a DataPoint, Operator or Capability must be imported at startup, or the flow
+that references it will not resume.
+
 ## Telemetry exporters
 
 The framework instruments itself against the OpenTelemetry **API** only, which no-ops until a
@@ -206,3 +265,5 @@ renders the graph to stdout, which is worth committing to your own docs.
 - [ ] A real `ValueCipher` is wired if any DataPoint is marked `is_pii`
 - [ ] OTel exporters, if any, are the batching ones
 - [ ] Something calls `resume` for orphaned sessions on a schedule
+- [ ] For a Node worker: its node-redis `socketTimeout` is well above the 1s inbox keepalive, or
+      unset — node-redis does not reconnect after that deadline

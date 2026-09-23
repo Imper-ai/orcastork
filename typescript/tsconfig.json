@@ -1,0 +1,29 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "types": ["node"],
+
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "forceConsistentCasingInFileNames": true,
+
+    "verbatimModuleSyntax": true,
+    "isolatedModules": true,
+    "declaration": true,
+    "skipLibCheck": true,
+
+    // Off on purpose: registration uses TS 5 standard decorators, which is what the runtime,
+    // the test transpiler and tsc all agree on. Legacy decorators would be a third dialect.
+    "experimentalDecorators": false,
+
+    "noEmit": true
+  },
+  "include": ["src", "tests", "vitest.config.ts", "vitest.integration.config.ts"]
+}

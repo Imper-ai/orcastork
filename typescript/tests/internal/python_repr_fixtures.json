@@ -1,0 +1,661 @@
+{
+  "generated_by": "tests/internal/python_repr_fixtures.py",
+  "python_version": "3.13.12",
+  "repr": [
+    {
+      "id": "null",
+      "json": "null",
+      "expected": "None"
+    },
+    {
+      "id": "true",
+      "json": "true",
+      "expected": "True"
+    },
+    {
+      "id": "false",
+      "json": "false",
+      "expected": "False"
+    },
+    {
+      "id": "int-zero",
+      "json": "0",
+      "expected": "0"
+    },
+    {
+      "id": "int-negative",
+      "json": "-1",
+      "expected": "-1"
+    },
+    {
+      "id": "int-small",
+      "json": "42",
+      "expected": "42"
+    },
+    {
+      "id": "int-2-53",
+      "json": "9007199254740992",
+      "expected": "9007199254740992"
+    },
+    {
+      "id": "int-beyond-2-53",
+      "json": "9007199254740993",
+      "expected": "9007199254740993",
+      "expected_js": "9007199254740992"
+    },
+    {
+      "id": "int-negative-2-53",
+      "json": "-9007199254740992",
+      "expected": "-9007199254740992"
+    },
+    {
+      "id": "int-json-minus-zero",
+      "json": "-0",
+      "expected": "0"
+    },
+    {
+      "id": "float-tenth",
+      "json": "0.1",
+      "expected": "0.1"
+    },
+    {
+      "id": "float-negative-tenth",
+      "json": "-0.1",
+      "expected": "-0.1"
+    },
+    {
+      "id": "float-third",
+      "json": "0.3333333333333333",
+      "expected": "0.3333333333333333"
+    },
+    {
+      "id": "float-mixed",
+      "json": "123456789.123",
+      "expected": "123456789.123"
+    },
+    {
+      "id": "float-half",
+      "json": "0.5",
+      "expected": "0.5"
+    },
+    {
+      "id": "float-1e-4",
+      "json": "0.0001",
+      "expected": "0.0001"
+    },
+    {
+      "id": "float-1e-5",
+      "json": "1e-5",
+      "expected": "1e-05"
+    },
+    {
+      "id": "float-5e-324",
+      "json": "5e-324",
+      "expected": "5e-324"
+    },
+    {
+      "id": "float-1e16-is-integral-in-js",
+      "json": "1e16",
+      "expected": "1e+16",
+      "expected_js": "10000000000000000"
+    },
+    {
+      "id": "float-1e21-is-integral-in-js",
+      "json": "1e21",
+      "expected": "1e+21",
+      "expected_js": "1000000000000000000000"
+    },
+    {
+      "id": "float-one-point-zero-is-integral-in-js",
+      "json": "1.0",
+      "expected": "1.0",
+      "expected_js": "1"
+    },
+    {
+      "id": "float-minus-zero-is-integral-in-js",
+      "json": "-0.0",
+      "expected": "-0.0",
+      "expected_js": "0"
+    },
+    {
+      "id": "float-2e3-is-integral-in-js",
+      "json": "2.0e3",
+      "expected": "2000.0",
+      "expected_js": "2000"
+    },
+    {
+      "id": "str-empty",
+      "json": "\"\"",
+      "expected": "''"
+    },
+    {
+      "id": "str-plain",
+      "json": "\"hello\"",
+      "expected": "'hello'"
+    },
+    {
+      "id": "str-with-space",
+      "json": "\"hello world\"",
+      "expected": "'hello world'"
+    },
+    {
+      "id": "str-single-quote",
+      "json": "\"it's\"",
+      "expected": "\"it's\""
+    },
+    {
+      "id": "str-double-quote",
+      "json": "\"say \\\"hi\\\"\"",
+      "expected": "'say \"hi\"'"
+    },
+    {
+      "id": "str-both-quotes",
+      "json": "\"both ' and \\\"\"",
+      "expected": "'both \\' and \"'"
+    },
+    {
+      "id": "str-backslash",
+      "json": "\"a\\\\b\"",
+      "expected": "'a\\\\b'"
+    },
+    {
+      "id": "str-newline",
+      "json": "\"line1\\nline2\"",
+      "expected": "'line1\\nline2'"
+    },
+    {
+      "id": "str-tab-cr",
+      "json": "\"a\\tb\\rc\"",
+      "expected": "'a\\tb\\rc'"
+    },
+    {
+      "id": "str-control",
+      "json": "\"bell:\\u0007 null:\\u0000 del:\\u007f\"",
+      "expected": "'bell:\\x07 null:\\x00 del:\\x7f'"
+    },
+    {
+      "id": "str-accented",
+      "json": "\"caf\\u00e9\"",
+      "expected": "'caf\u00e9'"
+    },
+    {
+      "id": "str-nbsp",
+      "json": "\"a\\u00a0b\"",
+      "expected": "'a\\xa0b'"
+    },
+    {
+      "id": "str-emoji",
+      "json": "\"\\ud83d\\ude00\"",
+      "expected": "'\ud83d\ude00'"
+    },
+    {
+      "id": "str-emoji-zwj-sequence",
+      "json": "\"\\ud83d\\udc69\\u200d\\ud83d\\udcbb\"",
+      "expected": "'\ud83d\udc69\\u200d\ud83d\udcbb'"
+    },
+    {
+      "id": "str-rtl-marks",
+      "json": "\"\\u200f\\u0627\\u0644\\u0639\\u0631\\u0628\\u064a\\u0629\\u200e\"",
+      "expected": "'\\u200f\u0627\u0644\u0639\u0631\u0628\u064a\u0629\\u200e'"
+    },
+    {
+      "id": "str-cjk",
+      "json": "\"\\u6f22\\u5b57\"",
+      "expected": "'\u6f22\u5b57'"
+    },
+    {
+      "id": "str-private-use",
+      "json": "\"\\ue000\"",
+      "expected": "'\\ue000'"
+    },
+    {
+      "id": "str-line-separator",
+      "json": "\"a\\u2028b\"",
+      "expected": "'a\\u2028b'"
+    },
+    {
+      "id": "str-astral-non-emoji",
+      "json": "\"\\ud840\\udc0b\"",
+      "expected": "'\ud840\udc0b'"
+    },
+    {
+      "id": "str-replacement-character",
+      "json": "\"\\ufffd\"",
+      "expected": "'\ufffd'"
+    },
+    {
+      "id": "list-empty",
+      "json": "[]",
+      "expected": "()"
+    },
+    {
+      "id": "list-one",
+      "json": "[1]",
+      "expected": "(1,)"
+    },
+    {
+      "id": "list-two",
+      "json": "[1, 2]",
+      "expected": "(1, 2)"
+    },
+    {
+      "id": "list-of-strings",
+      "json": "[\"x\", \"y\", \"z\"]",
+      "expected": "('x', 'y', 'z')"
+    },
+    {
+      "id": "list-order-matters",
+      "json": "[\"y\", \"x\"]",
+      "expected": "('y', 'x')"
+    },
+    {
+      "id": "list-nested",
+      "json": "[[1, 2], [3]]",
+      "expected": "((1, 2), (3,))"
+    },
+    {
+      "id": "list-one-nested-empty",
+      "json": "[[]]",
+      "expected": "((),)"
+    },
+    {
+      "id": "list-mixed",
+      "json": "[1, \"two\", true, null, 3.5]",
+      "expected": "(1, 'two', True, None, 3.5)"
+    },
+    {
+      "id": "list-of-objects",
+      "json": "[{\"b\": 1, \"a\": 2}, {\"a\": 1}]",
+      "expected": "((('a', 2), ('b', 1)), (('a', 1),))"
+    },
+    {
+      "id": "object-empty",
+      "json": "{}",
+      "expected": "()"
+    },
+    {
+      "id": "object-one",
+      "json": "{\"a\": 1}",
+      "expected": "(('a', 1),)"
+    },
+    {
+      "id": "object-unsorted",
+      "json": "{\"b\": 1, \"a\": 2}",
+      "expected": "(('a', 2), ('b', 1))"
+    },
+    {
+      "id": "object-sorted",
+      "json": "{\"a\": 2, \"b\": 1}",
+      "expected": "(('a', 2), ('b', 1))"
+    },
+    {
+      "id": "object-nested-unsorted",
+      "json": "{\"b\": 1, \"a\": {\"d\": 4, \"c\": 3}}",
+      "expected": "(('a', (('c', 3), ('d', 4))), ('b', 1))"
+    },
+    {
+      "id": "object-deep",
+      "json": "{\"outer\": {\"inner\": {\"leaf\": [1, 2]}}}",
+      "expected": "(('outer', (('inner', (('leaf', (1, 2)),)),)),)"
+    },
+    {
+      "id": "object-value-empty-containers",
+      "json": "{\"list\": [], \"object\": {}}",
+      "expected": "(('list', ()), ('object', ()))"
+    },
+    {
+      "id": "object-numeric-looking-keys",
+      "json": "{\"10\": \"ten\", \"9\": \"nine\", \"1\": \"one\"}",
+      "expected": "(('1', 'one'), ('10', 'ten'), ('9', 'nine'))"
+    },
+    {
+      "id": "object-keys-needing-escapes",
+      "json": "{\"a\\nb\": 1, \"a'b\": 2, \"a\\\\b\": 3}",
+      "expected": "(('a\\nb', 1), (\"a'b\", 2), ('a\\\\b', 3))"
+    },
+    {
+      "id": "object-empty-key",
+      "json": "{\"\": 1}",
+      "expected": "(('', 1),)"
+    },
+    {
+      "id": "object-astral-vs-bmp-keys",
+      "json": "{\"z\": 0, \"\\u00e9\": 1, \"\\ufffd\": 2, \"\\ud83d\\ude00\": 3, \"\\ue000\": 4}",
+      "expected": "(('z', 0), ('\u00e9', 1), ('\\ue000', 4), ('\ufffd', 2), ('\ud83d\ude00', 3))"
+    },
+    {
+      "id": "object-key-prefix-order",
+      "json": "{\"ab\": 1, \"a\": 2, \"b\": 3}",
+      "expected": "(('a', 2), ('ab', 1), ('b', 3))"
+    },
+    {
+      "id": "object-with-mixed-values",
+      "json": "{\"n\": null, \"t\": true, \"f\": false, \"i\": 7, \"x\": 0.25, \"s\": \"q\"}",
+      "expected": "(('f', False), ('i', 7), ('n', None), ('s', 'q'), ('t', True), ('x', 0.25))"
+    },
+    {
+      "id": "geo-like",
+      "json": "{\"lat\": 51.5, \"lon\": -0.12}",
+      "expected": "(('lat', 51.5), ('lon', -0.12))"
+    },
+    {
+      "id": "geo-like-reordered",
+      "json": "{\"lon\": -0.12, \"lat\": 51.5}",
+      "expected": "(('lat', 51.5), ('lon', -0.12))"
+    },
+    {
+      "id": "tags-like",
+      "json": "{\"tags\": [\"x\", \"y\"], \"groups\": []}",
+      "expected": "(('groups', ()), ('tags', ('x', 'y')))"
+    },
+    {
+      "id": "deeply-nested-mixed",
+      "json": "{\"a\": [{\"b\": [1, {\"c\": null}]}], \"d\": {\"e\": []}}",
+      "expected": "(('a', ((('b', (1, (('c', None),))),),)), ('d', (('e', ()),)))"
+    }
+  ],
+  "float": [
+    {
+      "id": "zero",
+      "literal": "0.0",
+      "expected": "0.0"
+    },
+    {
+      "id": "negative-zero",
+      "literal": "-0.0",
+      "expected": "-0.0"
+    },
+    {
+      "id": "one",
+      "literal": "1.0",
+      "expected": "1.0"
+    },
+    {
+      "id": "minus-one",
+      "literal": "-1.0",
+      "expected": "-1.0"
+    },
+    {
+      "id": "tenth",
+      "literal": "0.1",
+      "expected": "0.1"
+    },
+    {
+      "id": "two-thirds",
+      "literal": "0.6666666666666666",
+      "expected": "0.6666666666666666"
+    },
+    {
+      "id": "mixed",
+      "literal": "123456789.123",
+      "expected": "123456789.123"
+    },
+    {
+      "id": "negative-mixed",
+      "literal": "-123456789.123",
+      "expected": "-123456789.123"
+    },
+    {
+      "id": "1e-4-is-fixed",
+      "literal": "1e-4",
+      "expected": "0.0001"
+    },
+    {
+      "id": "1e-5-switches-to-exponent",
+      "literal": "1e-5",
+      "expected": "1e-05"
+    },
+    {
+      "id": "1.5e-7",
+      "literal": "1.5e-7",
+      "expected": "1.5e-07"
+    },
+    {
+      "id": "smallest-subnormal",
+      "literal": "5e-324",
+      "expected": "5e-324"
+    },
+    {
+      "id": "1e15-is-fixed",
+      "literal": "1e15",
+      "expected": "1000000000000000.0"
+    },
+    {
+      "id": "largest-fixed",
+      "literal": "9999999999999998.0",
+      "expected": "9999999999999998.0"
+    },
+    {
+      "id": "1e16-switches-to-exponent",
+      "literal": "1e16",
+      "expected": "1e+16"
+    },
+    {
+      "id": "1.7976931348623157e308",
+      "literal": "1.7976931348623157e308",
+      "expected": "1.7976931348623157e+308"
+    },
+    {
+      "id": "1e21",
+      "literal": "1e21",
+      "expected": "1e+21"
+    },
+    {
+      "id": "1e100",
+      "literal": "1e100",
+      "expected": "1e+100"
+    },
+    {
+      "id": "1.5e300",
+      "literal": "1.5e300",
+      "expected": "1.5e+300"
+    },
+    {
+      "id": "negative-1e16",
+      "literal": "-1e16",
+      "expected": "-1e+16"
+    },
+    {
+      "id": "fraction-at-the-fixed-edge",
+      "literal": "4503599627370495.5",
+      "expected": "4503599627370495.5"
+    },
+    {
+      "id": "nan",
+      "literal": "NaN",
+      "expected": "nan"
+    },
+    {
+      "id": "infinity",
+      "literal": "Infinity",
+      "expected": "inf"
+    },
+    {
+      "id": "negative-infinity",
+      "literal": "-Infinity",
+      "expected": "-inf"
+    }
+  ],
+  "str": [
+    {
+      "id": "empty",
+      "json": "\"\"",
+      "expected": "''"
+    },
+    {
+      "id": "ascii",
+      "json": "\"plain ascii\"",
+      "expected": "'plain ascii'"
+    },
+    {
+      "id": "single-quote-only",
+      "json": "\"it's\"",
+      "expected": "\"it's\""
+    },
+    {
+      "id": "double-quote-only",
+      "json": "\"she said \\\"no\\\"\"",
+      "expected": "'she said \"no\"'"
+    },
+    {
+      "id": "both-quotes",
+      "json": "\"it's \\\"fine\\\"\"",
+      "expected": "'it\\'s \"fine\"'"
+    },
+    {
+      "id": "backslash",
+      "json": "\"C:\\\\path\\\\to\"",
+      "expected": "'C:\\\\path\\\\to'"
+    },
+    {
+      "id": "backslash-and-quote",
+      "json": "\"\\\\'\"",
+      "expected": "\"\\\\'\""
+    },
+    {
+      "id": "newline",
+      "json": "\"a\\nb\"",
+      "expected": "'a\\nb'"
+    },
+    {
+      "id": "carriage-return",
+      "json": "\"a\\rb\"",
+      "expected": "'a\\rb'"
+    },
+    {
+      "id": "tab",
+      "json": "\"a\\tb\"",
+      "expected": "'a\\tb'"
+    },
+    {
+      "id": "form-feed-and-vertical-tab",
+      "json": "\"\\u000c\\u000b\"",
+      "expected": "'\\x0c\\x0b'"
+    },
+    {
+      "id": "nul",
+      "json": "\"\\u0000\"",
+      "expected": "'\\x00'"
+    },
+    {
+      "id": "escape-and-del",
+      "json": "\"\\u001b\\u007f\"",
+      "expected": "'\\x1b\\x7f'"
+    },
+    {
+      "id": "every-ascii-control",
+      "json": "\"\\u0000\\u0001\\u0002\\u0003\\u0004\\u0005\\u0006\\u0007\\u0008\\u0009\\u000a\\u000b\\u000c\\u000d\\u000e\\u000f\\u0010\\u0011\\u0012\\u0013\\u0014\\u0015\\u0016\\u0017\\u0018\\u0019\\u001a\\u001b\\u001c\\u001d\\u001e\\u001f\"",
+      "expected": "'\\x00\\x01\\x02\\x03\\x04\\x05\\x06\\x07\\x08\\t\\n\\x0b\\x0c\\r\\x0e\\x0f\\x10\\x11\\x12\\x13\\x14\\x15\\x16\\x17\\x18\\x19\\x1a\\x1b\\x1c\\x1d\\x1e\\x1f'"
+    },
+    {
+      "id": "latin-1-supplement-printable",
+      "json": "\"\\u00e9\\u00df\\u00ff\"",
+      "expected": "'\u00e9\u00df\u00ff'"
+    },
+    {
+      "id": "nbsp-is-not-printable",
+      "json": "\"\\u00a0\"",
+      "expected": "'\\xa0'"
+    },
+    {
+      "id": "soft-hyphen-is-not-printable",
+      "json": "\"\\u00ad\"",
+      "expected": "'\\xad'"
+    },
+    {
+      "id": "zero-width-joiner",
+      "json": "\"\\u200d\"",
+      "expected": "'\\u200d'"
+    },
+    {
+      "id": "zero-width-space",
+      "json": "\"\\u200b\"",
+      "expected": "'\\u200b'"
+    },
+    {
+      "id": "rtl-mark",
+      "json": "\"\\u200f\"",
+      "expected": "'\\u200f'"
+    },
+    {
+      "id": "lrm-and-arabic",
+      "json": "\"\\u200e\\u0627\"",
+      "expected": "'\\u200e\u0627'"
+    },
+    {
+      "id": "line-separator",
+      "json": "\"\\u2028\"",
+      "expected": "'\\u2028'"
+    },
+    {
+      "id": "paragraph-separator",
+      "json": "\"\\u2029\"",
+      "expected": "'\\u2029'"
+    },
+    {
+      "id": "ideographic-space",
+      "json": "\"\\u3000\"",
+      "expected": "'\\u3000'"
+    },
+    {
+      "id": "private-use-bmp",
+      "json": "\"\\ue000\"",
+      "expected": "'\\ue000'"
+    },
+    {
+      "id": "replacement-character",
+      "json": "\"\\ufffd\"",
+      "expected": "'\ufffd'"
+    },
+    {
+      "id": "noncharacter-fffe",
+      "json": "\"\\ufffe\"",
+      "expected": "'\\ufffe'"
+    },
+    {
+      "id": "bom",
+      "json": "\"\\ufeff\"",
+      "expected": "'\\ufeff'"
+    },
+    {
+      "id": "emoji",
+      "json": "\"\\ud83d\\ude00\"",
+      "expected": "'\ud83d\ude00'"
+    },
+    {
+      "id": "family-zwj-sequence",
+      "json": "\"\\ud83d\\udc68\\u200d\\ud83d\\udc69\\u200d\\ud83d\\udc66\"",
+      "expected": "'\ud83d\udc68\\u200d\ud83d\udc69\\u200d\ud83d\udc66'"
+    },
+    {
+      "id": "astral-cjk-extension",
+      "json": "\"\\ud840\\udc0b\"",
+      "expected": "'\ud840\udc0b'"
+    },
+    {
+      "id": "astral-private-use",
+      "json": "\"\\udbff\\udffd\"",
+      "expected": "'\\U0010fffd'"
+    },
+    {
+      "id": "astral-tag-character",
+      "json": "\"\\udb40\\udc61\"",
+      "expected": "'\\U000e0061'"
+    },
+    {
+      "id": "lone-surrogate",
+      "json": "\"\\ud800\"",
+      "expected": "'\\ud800'"
+    },
+    {
+      "id": "mixed-scripts",
+      "json": "\"caf\\u00e9 \\u6f22\\u5b57 \\ud83d\\ude00 \\u0627\\u0644\\u0639\"",
+      "expected": "'caf\u00e9 \u6f22\u5b57 \ud83d\ude00 \u0627\u0644\u0639'"
+    },
+    {
+      "id": "mixed-escapes-and-text",
+      "json": "\"tab\\there\\nand \\\"quoted\\\" \\u00e9\\u200d\"",
+      "expected": "'tab\\there\\nand \"quoted\" \u00e9\\u200d'"
+    }
+  ]
+}

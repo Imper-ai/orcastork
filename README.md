@@ -124,8 +124,9 @@ pipeline, because there is no pipeline to edit.
   most a Redis and a MongoDB — with a fully functional in-memory mode when it needs neither.
 
 The trade is deliberate: you get data-driven scheduling, resumability and an audit trail
-without a control plane to operate, and you give up cron-style batch scheduling, a built-in
-UI, and cross-language workers.
+without a control plane to operate, and you give up cron-style batch scheduling and a built-in
+UI. Cross-language workers are no longer part of that trade: the [TypeScript port](#typescript)
+shares the same wire formats, so Python and Node processes can work the same sessions.
 
 ## Looking for something smaller?
 
@@ -133,6 +134,22 @@ UI, and cross-language workers.
 scheduling core and the dependency injection: operators, capabilities, readiness-driven reruns,
 retries, timeouts and cycle bounding — no durability, resumability, epochs, inbox, aggregators,
 audit or telemetry. A session lives and dies in one process and returns its DataPoints.
+
+## TypeScript
+
+[`typescript/`](typescript/README.md) is the same framework as an npm package — `orcastork`, with
+`orcastork` and `orcastork/lite` entrypoints — ported file for file: the same ports, the same
+memory / Redis / Mongo adapters, the same invariants, and one test per Python test that has a
+meaning there. It is built to be **wire-compatible**: the Redis keyspace and Lua scripts, the Mongo
+collections and document shapes, the audit and archive rows, the inbox payloads and the flow
+fingerprints are reproduced from the Python source and checked against it (identical Lua scripts,
+key and collection names, document shapes, canonical values pinned to CPython-generated fixtures,
+an identical fingerprint digest), so Python and Node workers are meant to share one deployment and
+resume each other's sessions. That has been verified by inspection and oracle checks, not yet by a
+mixed-runtime session run end to end. Read
+[typescript/README.md](typescript/README.md) for the guide, and its
+[Sharing a deployment with Python workers](typescript/README.md#sharing-a-deployment-with-python-workers)
+section for exactly what that covers and the two documented caveats.
 
 ## Documentation
 
@@ -143,6 +160,8 @@ audit or telemetry. A session lives and dies in one process and returns its Data
   checklist.
 - **[CLAUDE.md](CLAUDE.md)** — where each decision lives in the codebase, plus the invariants
   that must not be broken.
+- **[typescript/README.md](typescript/README.md)** — the TypeScript port: the same guide against
+  the npm package's API, plus what is byte-compatible between a Python worker and a Node one.
 - **[CONTRIBUTING.md](CONTRIBUTING.md)** — getting set up and what the checks expect.
 
 ## Status
