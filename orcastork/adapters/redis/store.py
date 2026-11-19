@@ -11,19 +11,25 @@ of interleaving (the script treats the DataPoint JSON as an opaque blob, so it n
 decode it). ``apply_resolved`` runs the same script without the ``write`` path's prior
 HGETALL: a sole-mutator caller that already resolved the merge supplies the 'a'/'u' mode per
 identity itself, so the hot write path costs one round-trip instead of a full re-read.
+
+Every key carries the optional ``key_prefix`` (none by default, the 0.1.1 layout). A stored
+DataPoint whose type this process has no leaf for (a newer deploy wrote it) is skipped with a
+warning on every read rather than failing the whole session; no write ever touches its field.
 """
 
 from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
 import orjson
+from loguru import logger
 from redis.asyncio import Redis
 
-from ...datapoints import BaseDataPoint, DataPointView, canonical_value, parse_data_point
-from ...exceptions import StaleEpochError
+from ...datapoints import BaseDataPoint, DataPointView, identity_string, parse_data_point
+from ...exceptions import StaleEpochError, UnknownDataPointTypeError
 from ...ids import Epoch, OperatorId, Revision, SessionId
 from ...ports.change_set import ChangeSet
 from ...ports.datapoint_store import EffectClaim
@@ -118,6 +124,14 @@ end
 return 0
 """
 
+
+@dataclass(frozen=True)
+class _StoredEntry:
+    data_point: BaseDataPoint[Any]
+    added: int
+    updated: int
+
+
 _CLAIM_RESULTS = {
     1: EffectClaim.ACQUIRED,
     2: EffectClaim.ALREADY_COMMITTED,
@@ -127,27 +141,39 @@ _CLAIM_RESULTS = {
 
 
 class RedisDataPointStore:
-    def __init__(self, redis: Redis, *, state_ttl_ms: int = DEFAULT_STATE_TTL_MS) -> None:
+    def __init__(self, redis: Redis, *, state_ttl_ms: int = DEFAULT_STATE_TTL_MS, key_prefix: str = '') -> None:
         # redis-py types its commands as a sync/async union (ResponseT); treat the client as
         # Any internally so awaits type cleanly, while the public param stays typed.
         self._redis: Any = redis
         self._state_ttl_ms = state_ttl_ms
+        self._prefix = key_prefix
 
     @staticmethod
     def _identity(data_point: BaseDataPoint[Any]) -> str:
-        # ``canonical_value`` is the shared string form of the keyed-merge identity (same normalization
-        # as the in-memory store and the archive), so dedup is identical across adapters.
-        return f'{data_point.type}\x00{canonical_value(data_point.value)}'
+        # The shared string form of the keyed-merge identity (same normalization as the in-memory
+        # store), so dedup is identical across adapters.
+        return f'{data_point.type}\x00{identity_string(data_point)}'
 
-    @staticmethod
-    def _keys(session_id: SessionId) -> tuple[str, str, str, str, str]:
+    def _key(self, name: str, session_id: SessionId) -> str:
+        return f'{self._prefix}{name}:{session_id}'
+
+    def _keys(self, session_id: SessionId) -> tuple[str, str, str, str, str]:
         return (
-            f'epoch:{session_id}',
-            f'rev:{session_id}',
-            f'dp:{session_id}',
-            f'added:{session_id}',
-            f'upd:{session_id}',
+            self._key('epoch', session_id),
+            self._key('rev', session_id),
+            self._key('dp', session_id),
+            self._key('added', session_id),
+            self._key('upd', session_id),
         )
+
+    def _parse(self, session_id: SessionId, raw: str) -> BaseDataPoint[Any] | None:
+        try:
+            return parse_data_point(orjson.loads(raw))
+        except UnknownDataPointTypeError:
+            # A newer deploy's type: this process cannot read it, and no operator here consumes it, so
+            # the rest of the session is still readable. Rolling back past a new type stays possible.
+            logger.warning('Skipped a stored DataPoint of a type this process does not know', session_id=session_id)
+            return None
 
     async def write(
         self, session_id: SessionId, data_points: Iterable[BaseDataPoint[Any]], *, epoch: Epoch
@@ -163,7 +189,7 @@ class RedisDataPointStore:
                 triples += [identity, 'a', orjson.dumps(data_point.model_dump(mode='json')).decode()]
             else:
                 existing_dp = parse_data_point(orjson.loads(existing_raw))
-                if data_point.last_retrieved > existing_dp.last_retrieved:
+                if existing_dp.same_value(data_point) and data_point.last_retrieved > existing_dp.last_retrieved:
                     merged = existing_dp.reobserved(data_point.last_retrieved)
                     triples += [identity, 'u', orjson.dumps(merged.model_dump(mode='json')).decode()]
         return await self._apply(session_id, triples, epoch)
@@ -204,24 +230,26 @@ class RedisDataPointStore:
             dp_key,
             added_key,
             upd_key,
-            f'wm:{session_id}',
-            f'fx:{session_id}',
-            f'meta:{session_id}',
+            self._key('wm', session_id),
+            self._key('fx', session_id),
+            self._key('meta', session_id),
         )
         return Revision(int(result))
 
-    async def _entries(self, session_id: SessionId) -> list[dict[str, Any]]:
+    async def _entries(self, session_id: SessionId) -> list[_StoredEntry]:
         _, _, dp_key, added_key, upd_key = self._keys(session_id)
         dps = await self._redis.hgetall(dp_key)
         added = await self._redis.hgetall(added_key)
         updated = await self._redis.hgetall(upd_key)
-        return [
-            {'dp': orjson.loads(raw), 'added': int(added.get(identity, 0)), 'updated': int(updated.get(identity, 0))}
-            for identity, raw in dps.items()
-        ]
+        entries: list[_StoredEntry] = []
+        for identity, raw in dps.items():
+            data_point = self._parse(session_id, raw)
+            if data_point is not None:
+                entries.append(_StoredEntry(data_point, int(added.get(identity, 0)), int(updated.get(identity, 0))))
+        return entries
 
     async def snapshot(self, session_id: SessionId) -> DataPointView:
-        return DataPointView(parse_data_point(entry['dp']) for entry in await self._entries(session_id))
+        return DataPointView(entry.data_point for entry in await self._entries(session_id))
 
     async def revision(self, session_id: SessionId) -> Revision:
         _, rev_key, _, _, _ = self._keys(session_id)
@@ -231,15 +259,14 @@ class RedisDataPointStore:
         added: list[BaseDataPoint[Any]] = []
         updated: list[BaseDataPoint[Any]] = []
         for entry in await self._entries(session_id):
-            data_point = parse_data_point(entry['dp'])
-            if entry['added'] > since:
-                added.append(data_point)
-            elif entry['updated'] > since:
-                updated.append(data_point)
+            if entry.added > since:
+                added.append(entry.data_point)
+            elif entry.updated > since:
+                updated.append(entry.data_point)
         return ChangeSet(added=tuple(added), updated=tuple(updated))
 
     async def get_watermark(self, session_id: SessionId, operator_id: OperatorId) -> Revision | None:
-        raw = await self._redis.hget(f'wm:{session_id}', operator_id)
+        raw = await self._redis.hget(self._key('wm', session_id), operator_id)
         return None if raw is None else Revision(int(raw))
 
     async def set_watermark(
@@ -247,11 +274,17 @@ class RedisDataPointStore:
     ) -> None:
         epoch_key, _, _, _, _ = self._keys(session_id)
         result = await self._redis.eval(
-            _GUARDED_FIELD_SCRIPT, 2, epoch_key, f'wm:{session_id}', str(int(epoch)), operator_id, str(int(revision))
+            _GUARDED_FIELD_SCRIPT,
+            2,
+            epoch_key,
+            self._key('wm', session_id),
+            str(int(epoch)),
+            operator_id,
+            str(int(revision)),
         )
         if int(result) == -1:
             raise StaleEpochError(f'epoch {epoch} is stale for session {session_id}')
-        await slide_ttl(self._redis, self._state_ttl_ms, epoch_key, f'wm:{session_id}')
+        await slide_ttl(self._redis, self._state_ttl_ms, epoch_key, self._key('wm', session_id))
 
     async def claim_effect(
         self, session_id: SessionId, effect_key: str, *, epoch: Epoch, reclaim_stale: bool
@@ -268,7 +301,7 @@ class RedisDataPointStore:
         await self._run_effect_script(_REVERT_EFFECT_SCRIPT, session_id, effect_key, epoch)
 
     async def get_effect_state(self, session_id: SessionId, effect_key: str) -> str | None:
-        raw = await self._redis.hget(f'fx:{session_id}', effect_key)
+        raw = await self._redis.hget(self._key('fx', session_id), effect_key)
         return None if raw is None else str(raw)
 
     async def _run_effect_script(
@@ -276,15 +309,15 @@ class RedisDataPointStore:
     ) -> int:
         epoch_key, _, _, _, _ = self._keys(session_id)
         result = await self._redis.eval(
-            script, 2, epoch_key, f'fx:{session_id}', str(int(epoch)), effect_key, *extra_args
+            script, 2, epoch_key, self._key('fx', session_id), str(int(epoch)), effect_key, *extra_args
         )
         if int(result) == -1:
             raise StaleEpochError(f'epoch {epoch} is stale for session {session_id}')
-        await slide_ttl(self._redis, self._state_ttl_ms, epoch_key, f'fx:{session_id}')
+        await slide_ttl(self._redis, self._state_ttl_ms, epoch_key, self._key('fx', session_id))
         return int(result)
 
     async def get_session_deadline(self, session_id: SessionId) -> datetime | None:
-        raw = await self._redis.hget(f'meta:{session_id}', 'deadline')
+        raw = await self._redis.hget(self._key('meta', session_id), 'deadline')
         return None if raw is None else datetime.fromisoformat(raw)
 
     async def set_session_deadline(self, session_id: SessionId, deadline: datetime, *, epoch: Epoch) -> None:
@@ -293,17 +326,17 @@ class RedisDataPointStore:
             _GUARDED_FIELD_SCRIPT,
             2,
             epoch_key,
-            f'meta:{session_id}',
+            self._key('meta', session_id),
             str(int(epoch)),
             'deadline',
             deadline.isoformat(),
         )
         if int(result) == -1:
             raise StaleEpochError(f'epoch {epoch} is stale for session {session_id}')
-        await slide_ttl(self._redis, self._state_ttl_ms, epoch_key, f'meta:{session_id}')
+        await slide_ttl(self._redis, self._state_ttl_ms, epoch_key, self._key('meta', session_id))
 
     async def get_flow_fingerprint(self, session_id: SessionId) -> str | None:
-        raw = await self._redis.hget(f'meta:{session_id}', 'flow_fingerprint')
+        raw = await self._redis.hget(self._key('meta', session_id), 'flow_fingerprint')
         return None if raw is None else str(raw)
 
     async def set_flow_fingerprint(self, session_id: SessionId, fingerprint: str, *, epoch: Epoch) -> None:
@@ -312,11 +345,11 @@ class RedisDataPointStore:
             _GUARDED_FIELD_SCRIPT,
             2,
             epoch_key,
-            f'meta:{session_id}',
+            self._key('meta', session_id),
             str(int(epoch)),
             'flow_fingerprint',
             fingerprint,
         )
         if int(result) == -1:
             raise StaleEpochError(f'epoch {epoch} is stale for session {session_id}')
-        await slide_ttl(self._redis, self._state_ttl_ms, epoch_key, f'meta:{session_id}')
+        await slide_ttl(self._redis, self._state_ttl_ms, epoch_key, self._key('meta', session_id))

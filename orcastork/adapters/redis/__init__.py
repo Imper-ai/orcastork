@@ -10,6 +10,14 @@ from .gate import RedisCooldownGate
 from .inbox import RedisStreamsInbox
 from .lock import RedisSessionLock
 from .rate_limiter import RedisRateLimiter
+from .runtime import build_redis_runtime
 from .store import RedisDataPointStore
 
-__all__ = ['RedisCooldownGate', 'RedisDataPointStore', 'RedisRateLimiter', 'RedisSessionLock', 'RedisStreamsInbox']
+__all__ = [
+    'RedisCooldownGate',
+    'RedisDataPointStore',
+    'RedisRateLimiter',
+    'RedisSessionLock',
+    'RedisStreamsInbox',
+    'build_redis_runtime',
+]

@@ -9,9 +9,9 @@ delivery never depends on it.
 
 Messages are held in their serialized wire form (what a stateless front door would put on a
 real transport), so delivery exercises the same tolerant-reader path as the Redis adapter:
-a payload whose bytes do not decode as JSON is surfaced as a ``PoisonInboxEntry`` instead of
-raising, and ``quarantine`` removes it from delivery while keeping it inspectable. Semantic
-deserialization failures (an unknown DataPoint type, a validation error) propagate instead.
+a payload whose bytes do not decode as JSON, or whose DataPoint type this process does not know,
+is surfaced as a ``PoisonInboxEntry`` instead of raising, and ``quarantine`` removes it from
+delivery while keeping it inspectable. A validation error on a known type propagates instead.
 """
 
 from __future__ import annotations
@@ -24,7 +24,7 @@ from uuid import uuid4
 import orjson
 
 from ...datapoints import BaseDataPoint, parse_data_point
-from ...exceptions import StaleEpochError
+from ...exceptions import StaleEpochError, UnknownDataPointTypeError
 from ...ids import Epoch, SessionId
 from ...ports.change_set import DeliveredInboxEntry, InboxEntry, PoisonInboxEntry, QuarantinedEntry
 
@@ -77,21 +77,18 @@ class InMemoryInbox:
 
     @staticmethod
     def _to_entry(message: _Message) -> DeliveredInboxEntry:
-        # Poison is reserved for a bad wire payload: only bytes that fail to decode as JSON.
-        # Semantic deserialization failures from parse_data_point (an unknown type, a validation
-        # error, a registry bug) propagate and fail fast — a quiet quarantine would hide a parser
-        # regression, and redelivery on resume lets a newer deployment parse what an older one
-        # could not.
+        # Poison is bytes that fail to decode as JSON, or a type this process has no leaf for (see the
+        # Redis adapter for why). A validation error on a known type propagates and fails fast.
         try:
-            decoded = orjson.loads(message.payload)
-        except orjson.JSONDecodeError as error:
+            data_point = parse_data_point(orjson.loads(message.payload))
+        except (orjson.JSONDecodeError, UnknownDataPointTypeError) as error:
             return PoisonInboxEntry(
                 entry_id=message.entry_id,
                 error=f'{type(error).__name__}: {error}',
                 delivery_count=message.delivery_count,
                 raw_payload=message.payload,
             )
-        return InboxEntry(message.entry_id, parse_data_point(decoded), message.delivery_count)
+        return InboxEntry(message.entry_id, data_point, message.delivery_count)
 
     async def consume(
         self, session_id: SessionId, *, max_entries: int | None = None

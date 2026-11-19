@@ -7,12 +7,17 @@ polling; the durable entry is the XADD — pub/sub only bounds wake latency); ``
 surfacing); ``ack`` → epoch-guarded ``XACK`` after the durable apply. Sessions are isolated
 by their stream key.
 
-Delivery tolerates a bad wire payload only: a missing payload field or bytes that do not
-decode as JSON are surfaced as a ``PoisonInboxEntry`` instead of raising, while semantic
-deserialization failures (an unknown DataPoint type, a validation error) propagate.
-``quarantine`` disposes of an entry atomically
+Delivery tolerates a bad wire payload, and a type this process does not know: a missing
+payload field, bytes that do not decode as JSON, or a DataPoint type with no leaf here (a newer
+deploy delivered it) are surfaced as a ``PoisonInboxEntry`` instead of raising, while a
+validation error on a known type propagates. ``quarantine`` disposes of an entry atomically
 (epoch-guarded ``XACK`` + a JSON record pushed onto ``quarantine:{session}``), and
 ``quarantined`` reads those records back.
+
+The stream is trimmed as it is consumed: an acked or quarantined entry is deleted from it in the
+same atomic step, so the stream holds only what is still undelivered or in flight, and
+``pending_count`` is its length. The stream key carries the sliding state TTL from the moment it
+exists. Every key and channel carries the optional ``key_prefix``.
 """
 
 from __future__ import annotations
@@ -25,7 +30,7 @@ from redis.exceptions import ResponseError
 from redis.exceptions import TimeoutError as RedisTimeoutError
 
 from ...datapoints import BaseDataPoint, parse_data_point
-from ...exceptions import StaleEpochError
+from ...exceptions import StaleEpochError, UnknownDataPointTypeError
 from ...ids import Epoch, SessionId
 from ...ports.change_set import DeliveredInboxEntry, InboxEntry, PoisonInboxEntry, QuarantinedEntry
 from .ttl import DEFAULT_STATE_TTL_MS, slide_ttl
@@ -37,23 +42,23 @@ _GROUP = 'orchestrator'
 _WAKEUP_POLL_TIMEOUT_SECONDS = 1.0
 _CONSUMER = 'orchestrator'
 
-# Atomically epoch-guard the ack: reject a stale epoch, else bump the inbox epoch and XACK,
-# counting the ack only if it removed a pending entry. KEYS = epoch, stream, acked; ARGV =
-# epoch, group, entry_id.
+# Atomically epoch-guard the ack: reject a stale epoch, else bump the inbox epoch, XACK, and delete
+# the acked entry from the stream, so the stream is trimmed as it is applied. KEYS = epoch, stream;
+# ARGV = epoch, group, entry_id.
 _ACK_SCRIPT = """
 local epoch = tonumber(ARGV[1])
 local stored = tonumber(redis.call('GET', KEYS[1]) or '0')
 if epoch < stored then return -1 end
 if epoch > stored then redis.call('SET', KEYS[1], epoch) end
 local acked = redis.call('XACK', KEYS[2], ARGV[2], ARGV[3])
-if acked == 1 then redis.call('INCR', KEYS[3]) end
+if acked == 1 then redis.call('XDEL', KEYS[2], ARGV[3]) end
 return acked
 """
 
 # Atomically epoch-guard the quarantine: reject a stale epoch, else bump the inbox epoch and
-# XACK the entry out of pending delivery; iff that removed it, count the ack (pending_count
-# bookkeeping) and push the durable quarantine record — so a fenced predecessor can neither
-# drop the entry nor double-record it. KEYS = epoch, stream, acked, quarantine; ARGV = epoch,
+# XACK the entry out of pending delivery; iff that removed it, delete it from the stream and push
+# the durable quarantine record (which keeps the raw payload) — so a fenced predecessor can
+# neither drop the entry nor double-record it. KEYS = epoch, stream, quarantine; ARGV = epoch,
 # group, entry_id, record_json.
 _QUARANTINE_SCRIPT = """
 local epoch = tonumber(ARGV[1])
@@ -62,21 +67,21 @@ if epoch < stored then return -1 end
 if epoch > stored then redis.call('SET', KEYS[1], epoch) end
 local acked = redis.call('XACK', KEYS[2], ARGV[2], ARGV[3])
 if acked == 1 then
-  redis.call('INCR', KEYS[3])
-  redis.call('RPUSH', KEYS[4], ARGV[4])
+  redis.call('XDEL', KEYS[2], ARGV[3])
+  redis.call('RPUSH', KEYS[3], ARGV[4])
 end
 return acked
 """
 
 
 class RedisStreamsInbox:
-    def __init__(self, redis: Redis, *, state_ttl_ms: int = DEFAULT_STATE_TTL_MS) -> None:
+    def __init__(self, redis: Redis, *, state_ttl_ms: int = DEFAULT_STATE_TTL_MS, key_prefix: str = '') -> None:
         self._redis: Any = redis  # see RedisDataPointStore: redis-py's sync/async union typing
         self._state_ttl_ms = state_ttl_ms
+        self._prefix = key_prefix
 
-    @staticmethod
-    def _stream(session_id: SessionId) -> str:
-        return f'inbox:{session_id}'
+    def _stream(self, session_id: SessionId) -> str:
+        return f'{self._prefix}inbox:{session_id}'
 
     async def _ensure_group(self, session_id: SessionId) -> None:
         try:
@@ -84,14 +89,23 @@ class RedisStreamsInbox:
         except ResponseError as error:
             if 'BUSYGROUP' not in str(error):
                 raise
+            return
+        # Creating the group can create the stream itself; it must expire with the session from then on.
+        await slide_ttl(self._redis, self._state_ttl_ms, self._stream(session_id))
 
-    @staticmethod
-    def _wakeup_channel(session_id: SessionId) -> str:
-        return f'inbox-wakeup:{session_id}'
+    def _wakeup_channel(self, session_id: SessionId) -> str:
+        return f'{self._prefix}inbox-wakeup:{session_id}'
 
-    @staticmethod
-    def _quarantine_key(session_id: SessionId) -> str:
-        return f'quarantine:{session_id}'
+    def _quarantine_key(self, session_id: SessionId) -> str:
+        return f'{self._prefix}quarantine:{session_id}'
+
+    def _epoch_key(self, session_id: SessionId) -> str:
+        return f'{self._prefix}inbox_epoch:{session_id}'
+
+    def _acked_key(self, session_id: SessionId) -> str:
+        # Written only by 0.1.1, which counted acks instead of deleting the acked entries; read so a
+        # stream it left behind still reports the right pending count.
+        return f'{self._prefix}acked:{session_id}'
 
     async def append(self, session_id: SessionId, data_point: BaseDataPoint[Any]) -> str:
         # The client decodes responses, so payloads flow as str — decode the orjson bytes here.
@@ -103,19 +117,22 @@ class RedisStreamsInbox:
         return str(entry_id)
 
     def _to_entry(self, entry_id: str, fields: dict[str, str], delivery_count: int) -> DeliveredInboxEntry:
-        # Poison is reserved for a bad wire payload: only a missing payload field (a foreign
-        # producer's malformed XADD) or bytes that fail to decode as JSON. Semantic
-        # deserialization failures from parse_data_point (an unknown type, a validation error, a
-        # registry bug) propagate and fail fast — a quiet quarantine would hide a parser
-        # regression, and redelivery on resume lets a newer deployment parse what an older one
-        # could not.
+        # Poison is a bad wire payload — a missing payload field (a foreign producer's malformed XADD)
+        # or bytes that fail to decode as JSON — or a type this process has no leaf for. The unknown
+        # type is set aside rather than raised: raising would fail every pass of the session, and left
+        # unacked it would hold the inbox open forever. A validation error on a known type still
+        # propagates and fails fast, so a parser regression is never quietly quarantined.
         try:
             decoded = orjson.loads(fields['data'])
         except (orjson.JSONDecodeError, KeyError) as error:
             return PoisonInboxEntry(
                 str(entry_id), f'{type(error).__name__}: {error}', delivery_count, fields.get('data')
             )
-        return InboxEntry(str(entry_id), parse_data_point(decoded), delivery_count)
+        try:
+            data_point = parse_data_point(decoded)
+        except UnknownDataPointTypeError as error:
+            return PoisonInboxEntry(str(entry_id), f'{type(error).__name__}: {error}', delivery_count, fields['data'])
+        return InboxEntry(str(entry_id), data_point, delivery_count)
 
     async def consume(
         self, session_id: SessionId, *, max_entries: int | None = None
@@ -150,23 +167,16 @@ class RedisStreamsInbox:
     async def ack(self, session_id: SessionId, entry_id: str, *, epoch: Epoch) -> None:
         result = await self._redis.eval(
             _ACK_SCRIPT,
-            3,
-            f'inbox_epoch:{session_id}',
+            2,
+            self._epoch_key(session_id),
             self._stream(session_id),
-            f'acked:{session_id}',
             str(int(epoch)),
             _GROUP,
             entry_id,
         )
         if int(result) == -1:
             raise StaleEpochError(f'epoch {epoch} is stale for session {session_id}')
-        await slide_ttl(
-            self._redis,
-            self._state_ttl_ms,
-            self._stream(session_id),
-            f'acked:{session_id}',
-            f'inbox_epoch:{session_id}',
-        )
+        await slide_ttl(self._redis, self._state_ttl_ms, self._stream(session_id), self._epoch_key(session_id))
 
     async def quarantine(self, session_id: SessionId, entry_id: str, *, reason: str, epoch: Epoch) -> None:
         # The group must exist for XPENDING/XACK: a quarantine racing ahead of any delivery
@@ -186,10 +196,9 @@ class RedisStreamsInbox:
         ).decode()
         result = await self._redis.eval(
             _QUARANTINE_SCRIPT,
-            4,
-            f'inbox_epoch:{session_id}',
+            3,
+            self._epoch_key(session_id),
             self._stream(session_id),
-            f'acked:{session_id}',
             self._quarantine_key(session_id),
             str(int(epoch)),
             _GROUP,
@@ -202,8 +211,7 @@ class RedisStreamsInbox:
             self._redis,
             self._state_ttl_ms,
             self._stream(session_id),
-            f'acked:{session_id}',
-            f'inbox_epoch:{session_id}',
+            self._epoch_key(session_id),
             self._quarantine_key(session_id),
         )
 
@@ -224,7 +232,7 @@ class RedisStreamsInbox:
 
     async def pending_count(self, session_id: SessionId) -> int:
         total = int(await self._redis.xlen(self._stream(session_id)))
-        acked = int(await self._redis.get(f'acked:{session_id}') or 0)
+        acked = int(await self._redis.get(self._acked_key(session_id)) or 0)
         return total - acked
 
     async def wait_for_entry(self, session_id: SessionId) -> None:

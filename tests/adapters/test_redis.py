@@ -22,25 +22,32 @@ from orcastork.adapters.redis import (
     RedisRateLimiter,
     RedisSessionLock,
     RedisStreamsInbox,
+    build_redis_runtime,
 )
 from orcastork.exceptions import StaleEpochError
-from orcastork.ids import Epoch, OperatorId, Revision, SessionId
+from orcastork.flow import FlowDefinition
+from orcastork.ids import Epoch, NamespaceId, OperatorId, Revision, SessionId
+from orcastork.manager import SessionOrchestrationManager
+from orcastork.orchestrator import Orchestrator, SessionStatus
 from orcastork.ports import CooldownGate, DataPointStore, Inbox, InboxEntry, SessionLock
 
 from ..doubles.clock import FakeClock
 from ..doubles.conformance import (
+    NEWER_DEPLOY_PAYLOAD,
     AppendRaw,
     CooldownGateConformance,
     InboxConformance,
     LockConformance,
     StoreConformance,
 )
-from ..doubles.datapoints import T0, personal_email, work_email
+from ..doubles.datapoints import T0, ChatAnswerDataPoint, chat_answer, personal_email, work_email
+from ..doubles.logs import capture_logs
 from ..doubles.redis_support import TimeControlledServer
 
 RZ = SessionId('rz-session')
 RZ_OTHER = SessionId('rz-other-session')
 RZ_OP = OperatorId('rz-op')
+RZ_NAMESPACE = NamespaceId('rz-namespace')
 T2 = T0 + timedelta(hours=2)
 
 
@@ -418,3 +425,122 @@ async def test_rz_27_reclaim_keeps_distinct_counts_for_concurrently_pending_entr
     reclaimed = await inbox.reclaim(RZ)  # one XAUTOCLAIM re-presents both, across the id range
     counts = {entry.entry_id: entry.delivery_count for entry in reclaimed}
     assert counts == {e1: 3, e2: 2}  # each entry mapped to its OWN times_delivered, never a shared count
+
+
+# --- 0.2.0: one runtime builder, a key prefix, a trimmed inbox, unknown types skipped ---------------------
+
+PREFIX = 'vw:'
+
+
+class TestBuiltRedisStore(StoreConformance):
+    @pytest.fixture
+    def store(self, redis_client: FakeRedis) -> DataPointStore:
+        return build_redis_runtime(redis_client, key_prefix=PREFIX).store
+
+
+class TestBuiltRedisInbox(InboxConformance):
+    @pytest.fixture
+    def inbox(self, redis_client: FakeRedis) -> Inbox:
+        return build_redis_runtime(redis_client, key_prefix=PREFIX).inbox
+
+    @pytest.fixture
+    def append_raw(self, redis_client: FakeRedis) -> AppendRaw:
+        async def _append(session_id: SessionId, payload: str) -> str:
+            return str(await redis_client.xadd(f'{PREFIX}inbox:{session_id}', {'data': payload}))
+
+        return _append
+
+
+class TestBuiltRedisSessionLock(LockConformance):
+    @pytest.fixture
+    def lock(self, redis_client: FakeRedis) -> SessionLock:
+        return build_redis_runtime(redis_client, key_prefix=PREFIX).lock
+
+    @pytest.fixture
+    def advance_time(self, redis_server: TimeControlledServer) -> Callable[[float], None]:
+        return redis_server.advance
+
+
+async def test_rz_27_every_key_and_channel_carries_the_prefix(redis_client: FakeRedis) -> None:
+    clock = FakeClock()
+    runtime = build_redis_runtime(redis_client, key_prefix=PREFIX, clock=clock)
+    wakeups = redis_client.pubsub()
+    await wakeups.psubscribe('*inbox-wakeup:*')
+    flow = FlowDefinition(name='rz-flow', operators=(), completes_when=ChatAnswerDataPoint, park_after=5.0)
+    manager = SessionOrchestrationManager(runtime)
+
+    parked = await manager.start_session(session_id=RZ, namespace_id=RZ_NAMESPACE, flow=flow, seed=[work_email()])
+    delivered = await manager.deliver(
+        session_id=RZ, namespace_id=RZ_NAMESPACE, data_point=chat_answer('answer'), flow=flow
+    )
+    await runtime.store.set_watermark(RZ, RZ_OP, Revision(1), epoch=Epoch(9))
+    await RedisCooldownGate(redis_client, key_prefix=PREFIX).try_acquire('gate', 10.0)
+    await RedisRateLimiter(redis_client, clock, rate_per_second=1.0, burst=1, key_prefix=PREFIX).acquire('api')
+
+    assert parked.status is SessionStatus.PARKED and delivered is not None
+    keys = await redis_client.keys('*')
+    assert keys and all(key.startswith(PREFIX) for key in keys)
+    channels = []
+    while (message := await wakeups.get_message(timeout=0.01)) is not None:
+        if message['type'] == 'pmessage':
+            channels.append(message['channel'])
+    assert channels and set(channels) == {f'{PREFIX}inbox-wakeup:{RZ}'}
+    await wakeups.aclose()
+
+
+async def test_rz_28_an_applied_inbox_is_trimmed_and_expires(redis_client: FakeRedis) -> None:
+    runtime = build_redis_runtime(redis_client, key_prefix=PREFIX, clock=FakeClock())
+    for index in range(3):
+        await runtime.inbox.append(RZ, chat_answer(f'answer-{index}'))
+
+    result = await Orchestrator(
+        session_id=RZ,
+        namespace_id=RZ_NAMESPACE,
+        runtime=runtime,
+        operators=[],
+        completes_when=ChatAnswerDataPoint,
+    ).run()
+
+    assert result.status is SessionStatus.COMPLETED
+    assert await redis_client.xlen(f'{PREFIX}inbox:{RZ}') == 0  # none of the applied deliveries stay
+    assert await redis_client.pttl(f'{PREFIX}inbox:{RZ}') > 0
+    assert await runtime.inbox.pending_count(RZ) == 0
+
+
+async def test_rz_29_a_stream_created_by_a_consume_expires(redis_client: FakeRedis) -> None:
+    inbox = RedisStreamsInbox(redis_client, state_ttl_ms=60_000)
+    assert await inbox.consume(RZ) == ()
+    assert await redis_client.pttl(f'inbox:{RZ}') > 0
+
+
+async def test_rz_30_a_stream_left_by_0_1_1_keeps_its_pending_count(redis_client: FakeRedis) -> None:
+    # 0.1.1 counted acks in `acked:` and kept the acked entries; 0.2.0 deletes them. Both must add up.
+    inbox = RedisStreamsInbox(redis_client)
+    first = await inbox.append(RZ, work_email('a@e.example'))
+    second = await inbox.append(RZ, personal_email('b@e.example'))
+    await inbox.consume(RZ)
+    await redis_client.xack(f'inbox:{RZ}', 'orchestrator', first)
+    await redis_client.set(f'acked:{RZ}', 1)
+    assert await inbox.pending_count(RZ) == 1
+
+    await inbox.ack(RZ, second, epoch=Epoch(1))
+    assert await inbox.pending_count(RZ) == 0
+
+
+async def test_rz_31_a_stored_data_point_of_an_unknown_type_is_skipped(redis_client: FakeRedis) -> None:
+    raw: Any = redis_client  # redis-py types its commands as a sync/async union
+    store = RedisDataPointStore(redis_client)
+    await store.write(RZ, [work_email('a@e.example')], epoch=Epoch(1))
+    await raw.hset(f'dp:{RZ}', 'type_from_a_newer_deploy\x00x', NEWER_DEPLOY_PAYLOAD)
+    await raw.hset(f'added:{RZ}', 'type_from_a_newer_deploy\x00x', 2)
+
+    with capture_logs() as records:
+        snapshot = await store.snapshot(RZ)
+        changes = await store.change_set_since(RZ, Revision(0))
+
+    assert [point.value for point in snapshot.all()] == ['a@e.example']
+    assert [point.value for point in changes.added] == ['a@e.example']
+    assert any('does not know' in record['message'] for record in records)
+    # A write never touches the unknown field.
+    await store.write(RZ, [personal_email('b@e.example')], epoch=Epoch(1))
+    assert await raw.hget(f'dp:{RZ}', 'type_from_a_newer_deploy\x00x') == NEWER_DEPLOY_PAYLOAD

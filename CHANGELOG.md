@@ -9,6 +9,28 @@ under **Changed** with the migration.
 
 ## [Unreleased]
 
+## [0.2.0]
+
+Fixes for sessions that live for minutes to hours, across pods and deploys.
+
+### Changed
+
+- **`start_session` on an existing session no longer starts another run.** A completed session is
+  returned as it is (`COMPLETED`, its current epoch, no operator runs), a live one is returned as
+  the new `SessionStatus.RUNNING` instead of raising `LockHeldError`, and a parked or orphaned one
+  is resumed (without the seed, which it already holds). A session with no state is new, as before.
+  Migration: a caller that relied on `LockHeldError`, or on re-running a completed session through
+  `start_session`, checks the returned status, or calls `reopen` for a completed session.
+- **The lease is renewed while operators run.** The gathering loop renewed only between passes, so
+  an operator that outlived the lock TTL lost its session to another pod, which re-ran it while the
+  first was still running. A renewal that finds a higher epoch still stops the run as `SUPERSEDED`.
+  The lock TTL no longer has to exceed the longest `OperatorPolicy.timeout`, only `operation_timeout`.
+- **A failed audit write is logged and dropped,** bounded by `Orchestrator(audit_timeout=...)`
+  (5s by default), instead of stalling or crashing the run. A `StaleEpochError` still stops it.
+- **An inbox entry of a DataPoint type this process does not know is delivered as poison** and
+  quarantined, instead of raising out of every pass of the session.
+- The completion tail's per-step log is DEBUG, no longer INFO.
+
 ### Added
 
 - **`orcastork_lite`**, a second package in the same distribution: the scheduling core and the
@@ -21,6 +43,38 @@ under **Changed** with the migration.
   consumer can follow a session while it runs. No durability, resumability, epochs, inbox, parking,
   aggregators, audit, archive or telemetry. The `orcastork-lite-graph` CLI (`orcastork_lite.tools`)
   validates the cycle policy and renders Mermaid from the classes a module exposes.
+- **Identity by declared fields.** `DataPointTypeConfig(identity_fields=(...))` names the fields of a
+  mapping or pydantic-model value that make its identity. The first value for an identity is kept;
+  a later, different value is dropped (`MergeKind.DROPPED`) and logged. Without it, identity stays
+  the whole value.
+- **A Redis key prefix.** Every Redis adapter takes `key_prefix` (default none, the 0.1.1 layout),
+  applied to every key and pub/sub channel.
+- **`build_redis_runtime`** (`orcastork.adapters.redis`): one client, one prefix, one state TTL,
+  wiring the store, inbox and lock, with no-op audit, archive and durable store ports.
+- **`NullAuditSink`, `NullDataPointArchive`, `NullDurableStore`** (`orcastork.ports`).
+- `UnhashableValueError`, `SessionStatus.RUNNING`, `DataPoint.identity`, `identity_string`.
+
+### Fixed
+
+- **A park rechecks the inbox before it releases the lease.** A delivery landing as the session
+  parked waited for the delivering pod's in-memory recheck, and was stranded if that pod died. It is
+  now gathered on the same epoch.
+- **The Redis inbox stream is trimmed** as entries are applied or quarantined, and a stream created
+  by a read expires with the session state. It used to grow by one entry per delivery, and a stream
+  created by a read never expired. A stream written by 0.1.1 keeps counting correctly.
+- **A stored DataPoint of an unknown type is skipped with a warning** on every Redis store read
+  (rehydrate, snapshot, change set) instead of failing the whole session, so a deploy that adds a
+  type can be rolled back.
+- Ported from `orcastork_lite`:
+  - **The session deadline is hard for in-flight runs:** each run's timeout is clipped to the budget
+    left, and completions already queued at the deadline are recorded rather than dropped.
+  - **A DataPoint's identity is computed once**, at construction, and an unhashable value is refused
+    there (`UnhashableValueError`), failing only the operator that emitted it. A set mixing types, and
+    a pydantic-model value, get a stable identity.
+  - **An armed retry is made terminal when its operator loses readiness,** instead of silently
+    vanishing.
+  - **Armed debounce and retry windows fire while other operators run,** instead of waiting for a
+    quiet operator to emit or finish.
 
 ## [0.1.1]
 
@@ -72,6 +126,7 @@ Its contents were:
   deployment wires an SDK, plus a loguru-to-OTel log bridge.
 - **Injected `Clock`** throughout, which is what makes the test suite deterministic and fast.
 
-[Unreleased]: https://github.com/Imper-ai/orcastork/compare/0.1.1...HEAD
+[Unreleased]: https://github.com/Imper-ai/orcastork/compare/0.2.0...HEAD
+[0.2.0]: https://github.com/Imper-ai/orcastork/compare/0.1.1...0.2.0
 [0.1.1]: https://github.com/Imper-ai/orcastork/releases/tag/0.1.1
 [0.1.0]: https://github.com/Imper-ai/orcastork/releases/tag/0.1.0

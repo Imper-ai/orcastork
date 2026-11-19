@@ -30,6 +30,7 @@ from .doubles.datapoints import (
     IpDataPoint,
     PersonalEmailDataPoint,
     TriggerDataPoint,
+    Turn,
     WorkEmailDataPoint,
     personal_email,
     work_email,
@@ -380,6 +381,10 @@ def _sample_value_for(leaf: type[BaseDataPoint[Any]]) -> Any:
         return ['x', 'y']
     if annotation == dict[str, list[str]]:
         return {'tags': ['x']}
+    if annotation is Turn:
+        return Turn(index=0, kind='probe')
+    if annotation is Any:
+        return 'probe'
     raise AssertionError(f'no sample value defined for leaf value type {annotation!r}')
 
 

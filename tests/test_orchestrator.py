@@ -912,8 +912,7 @@ async def test_orch_post_apply_audit_failure_still_acks_the_inbox_entry(fake_clo
     assert {dp.value for dp in (await runtime.store.snapshot(SID)).of_type(ChatAnswerDataPoint)} == {'applied'}
     assert await runtime.inbox.pending_count(SID) == 0  # acked despite the audit failure — no redelivery
     assert await runtime.inbox.quarantined(SID) == ()  # and no delivery budget was burned toward quarantine
-    error = next(record for record in records if record['level'].name == 'ERROR')
-    assert 'bookkeeping' in error['message']
+    assert any('Audit write failed' in record['message'] for record in records)  # dropped at the audit seam
 
 
 async def test_orch_post_apply_audit_failure_on_a_batch_still_acks_every_entry(fake_clock: FakeClock) -> None:
@@ -940,7 +939,7 @@ async def test_orch_post_apply_audit_failure_on_a_batch_still_acks_every_entry(f
     }
     assert await runtime.inbox.pending_count(SID) == 0  # the whole batch was acked
     assert await runtime.inbox.quarantined(SID) == ()
-    assert any(record['level'].name == 'ERROR' for record in records)
+    assert any('Audit write failed' in record['message'] for record in records)
 
 
 async def test_orch_unappliable_inbox_entry_is_quarantined_at_the_delivery_cap(fake_clock: FakeClock) -> None:

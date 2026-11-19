@@ -22,6 +22,10 @@ class UnknownDataPointTypeError(OrchestrationError):
     """A serialized DataPoint carried a ``type`` discriminator with no registered leaf."""
 
 
+class UnhashableValueError(OrchestrationError):
+    """A DataPoint value could not be reduced to a hashable identity (see ``datapoints.base._make_hashable``)."""
+
+
 class InvalidOperatorError(OrchestrationError):
     """An operator/aggregator definition is missing a required class attribute."""
 

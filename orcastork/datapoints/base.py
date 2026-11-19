@@ -1,7 +1,10 @@
 """The ``DataPoint`` model — the framework's unit of data.
 
 A ``DataPoint`` is a frozen pydantic model whose **identity is ``(type, value)``**,
-excluding timestamps, so re-observing a value dedups (keyed-merge). Concrete leaves pin
+excluding timestamps, so re-observing a value dedups (keyed-merge). A leaf may narrow the
+identity to named fields of its value (``DataPointTypeConfig.identity_fields``); the first value
+for such an identity is kept. The identity is computed once, at construction, so a value that
+cannot be made hashable is refused there (:class:`UnhashableValueError`). Concrete leaves pin
 a ``type`` ``Literal`` discriminator and carry a class-level :class:`DataPointTypeConfig`
 (``pii`` / ``ephemeral``); abstract intermediates group leaves for subtype substitution
 but are not union members.
@@ -15,14 +18,15 @@ lets :mod:`.registry` rebuild the discriminated-union ``TypeAdapter`` lazily.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, ClassVar, Self
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, PrivateAttr
 from pydantic_core import PydanticUndefined
 
-from ..exceptions import DuplicateRegistrationError, InvalidDataPointError
+from ..exceptions import DuplicateRegistrationError, InvalidDataPointError, UnhashableValueError
 from ..ids import DataPointType, OperatorRef
 
 # Registry of concrete leaves keyed by discriminator value, the set of abstract
@@ -45,22 +49,62 @@ class DataPointTypeConfig:
     two such types were ~78% of it — while every row is also a durable buffer write, so the cost lands
     on the database twice and the completion flush inherits all of it. Opting a type out replaces its
     per-emission rows with one counted summary, so the trail still says how many were merged.
+
+    ``identity_fields`` names the fields of the value that make a DataPoint's identity, for a value
+    that is a mapping or a pydantic model. Two values that agree on those fields are one DataPoint:
+    the first value merged is kept, and a later value that differs elsewhere is dropped (and
+    logged) rather than stored beside it. Empty, the default, keeps the whole value as identity.
     """
 
     pii: bool
     ephemeral: bool
     audit_every_emission: bool = True
+    identity_fields: tuple[str, ...] = ()
+
+
+def _sorted(items: Iterable[Any]) -> list[Any]:
+    # Natural order first, so a homogeneous value keeps the canonical form (and the Redis field) it had;
+    # repr is the fallback for a mix of types that cannot be compared with each other.
+    materialized = list(items)
+    try:
+        return sorted(materialized)
+    except TypeError:
+        return sorted(materialized, key=repr)
 
 
 def _make_hashable(obj: Any) -> Any:
-    """Recursively coerce a value into a hashable form (lists/dicts/sets → tuples)."""
+    """Recursively coerce a value into a hashable, order-insensitive form (lists/dicts/sets → tuples).
+
+    A pydantic model is reduced through its dump, so two models with equal fields share an identity.
+    Anything else must already be hashable: a value that is not raises :class:`UnhashableValueError`
+    where the DataPoint is built, instead of a ``TypeError`` from deep inside the session state.
+    """
     if isinstance(obj, (list, tuple)):
         return tuple(_make_hashable(item) for item in obj)
     if isinstance(obj, dict):
-        return tuple(sorted((key, _make_hashable(value)) for key, value in obj.items()))
+        return tuple(_sorted((key, _make_hashable(value)) for key, value in obj.items()))
     if isinstance(obj, (set, frozenset)):
-        return tuple(sorted(_make_hashable(item) for item in obj))
+        return tuple(_sorted(_make_hashable(item) for item in obj))
+    if isinstance(obj, BaseModel):
+        return _make_hashable(obj.model_dump())
+    try:
+        hash(obj)
+    except TypeError as error:
+        raise UnhashableValueError(f'{type(obj).__name__} value cannot be part of a DataPoint identity') from error
     return obj
+
+
+def _identity_value(value: Any, fields: tuple[str, ...]) -> Any:
+    """The part of ``value`` that makes its identity: the declared fields, else all of it."""
+    if not fields:
+        return _make_hashable(value)
+    if isinstance(value, BaseModel):
+        return _make_hashable({name: getattr(value, name) for name in fields})
+    if isinstance(value, dict):
+        return _make_hashable({name: value[name] for name in fields})
+    raise InvalidDataPointError(
+        f'identity_fields {fields} need a mapping or pydantic model value, not {type(value).__name__}'
+    )
 
 
 def canonical_value(value: Any) -> str:
@@ -79,11 +123,19 @@ def identity_key(data_point: 'BaseDataPoint[Any]') -> tuple[DataPointType, Any]:
     """The keyed-merge identity of a DataPoint — ``(type, normalized-value)``, timestamps excluded.
 
     The single source of truth for "the same DataPoint": the in-memory store and the keyed-merge
-    set key on this tuple, while string-keyed contexts (Redis hash fields, the archive key) use
-    :func:`canonical_value` of the value. Both build on the one ``_make_hashable`` normalization, so
-    dedup decisions never diverge across adapters.
+    set key on this tuple, and the Redis store keys its hash fields on :func:`identity_string`. Both
+    build on the one ``_make_hashable`` normalization, so dedup decisions never diverge across adapters.
     """
-    return (data_point.type, _make_hashable(data_point.value))
+    return data_point.identity
+
+
+def identity_string(data_point: 'BaseDataPoint[Any]') -> str:
+    """The process-stable string form of :func:`identity_key`, for string-keyed stores.
+
+    For a type with no ``identity_fields`` it is :func:`canonical_value` of the whole value, the
+    form 0.1.1 stored, so existing sessions keep their keys.
+    """
+    return repr(data_point.identity[1])
 
 
 def registry_version() -> int:
@@ -118,6 +170,12 @@ class BaseDataPoint[ValueT](BaseModel):
     config: ClassVar[DataPointTypeConfig]  # set on an intermediate (inherited) or per leaf
     __abstract__: ClassVar[bool] = True  # the base itself is abstract; leaves are concrete
 
+    # Computed once at construction: the model is frozen, so neither can change, and every keyed-merge,
+    # hash and equality check reads them back instead of re-normalizing the value. ``model_copy`` (a
+    # re-observation) carries them over.
+    _identity: tuple[DataPointType, Any] = PrivateAttr()
+    _value_key: Any = PrivateAttr()
+
     @classmethod
     def __pydantic_init_subclass__(cls, **kwargs: Any) -> None:
         super().__pydantic_init_subclass__(**kwargs)
@@ -151,13 +209,27 @@ class BaseDataPoint[ValueT](BaseModel):
         _REGISTRY[discriminator] = cls
         _registry_version += 1
 
+    def model_post_init(self, _context: Any, /) -> None:
+        self._value_key = _make_hashable(self.value)
+        fields = self.config.identity_fields
+        self._identity = (self.type, self._value_key if not fields else _identity_value(self.value, fields))
+
+    @property
+    def identity(self) -> tuple[DataPointType, Any]:
+        """The keyed-merge identity — ``(type, normalized identity value)``, timestamps excluded."""
+        return self._identity
+
+    def same_value(self, other: 'BaseDataPoint[Any]') -> bool:
+        """Whether ``other`` carries this exact value — the test that tells a refresh from a conflicting value."""
+        return self._value_key == other._value_key
+
     def __hash__(self) -> int:
-        return hash((self.type, _make_hashable(self.value)))
+        return hash(self._identity)
 
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, BaseDataPoint):
             return NotImplemented
-        return (self.type, _make_hashable(self.value)) == (other.type, _make_hashable(other.value))
+        return self._identity == other._identity
 
     @property
     def is_pii(self) -> bool:

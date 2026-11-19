@@ -67,7 +67,9 @@ class InMemoryDataPointStore:
             if existing is None:
                 state.entries[key] = _Entry(data_point, added_rev=next_revision, updated_rev=next_revision)
                 changed = True
-            elif data_point.last_retrieved > existing.data_point.last_retrieved:
+            elif existing.data_point.same_value(data_point) and (
+                data_point.last_retrieved > existing.data_point.last_retrieved
+            ):
                 existing.data_point = existing.data_point.reobserved(data_point.last_retrieved)
                 existing.updated_rev = next_revision
                 changed = True

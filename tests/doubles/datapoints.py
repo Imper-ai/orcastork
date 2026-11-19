@@ -3,13 +3,17 @@
 Includes an abstract intermediate (``EmailDataPoint``), two leaves sharing that
 substitution group (``WorkEmailDataPoint`` / ``PersonalEmailDataPoint``), a leaf with an
 unhashable ``dict`` value (``GeoDataPoint``, exercising ``_make_hashable``), and an
-ephemeral leaf (``TriggerDataPoint``). Importing this module self-registers the zoo.
+ephemeral leaf (``TriggerDataPoint``), a leaf that declares its identity fields
+(``TurnDataPoint``) and one that takes any value (``RawDataPoint``). Importing this module
+self-registers the zoo.
 """
 
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Literal
+from typing import Any, Literal
+
+from pydantic import BaseModel
 
 from orcastork.datapoints import BaseDataPoint, DataPointTypeConfig
 from orcastork.ids import OperatorId, OperatorRef
@@ -57,6 +61,23 @@ class ChatAnswerDataPoint(BaseDataPoint[str]):
 class TriggerDataPoint(BaseDataPoint[str]):
     # Ephemeral: emitted only to trigger another operator; never persisted.
     type: Literal['trigger'] = 'trigger'
+    config = DataPointTypeConfig(pii=False, ephemeral=True)
+
+
+class Turn(BaseModel):
+    index: int
+    kind: str
+
+
+class TurnDataPoint(BaseDataPoint[Turn]):
+    # Declares its identity: two turns at one index are one DataPoint, and the first value is kept.
+    type: Literal['turn'] = 'turn'
+    config = DataPointTypeConfig(pii=False, ephemeral=True, identity_fields=('index',))
+
+
+class RawDataPoint(BaseDataPoint[Any]):
+    # Takes any value, hashable or not — exercises the refusal of an unhashable identity.
+    type: Literal['raw'] = 'raw'
     config = DataPointTypeConfig(pii=False, ephemeral=True)
 
 

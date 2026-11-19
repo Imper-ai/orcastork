@@ -2,7 +2,9 @@
 
 Identity is ``(type, value)`` (timestamps excluded), so adding an equal DataPoint
 **merges** into the existing entry — keeping ``first_retrieved`` and advancing
-``last_retrieved`` — rather than duplicating or dropping the new timestamp. The
+``last_retrieved`` — rather than duplicating or dropping the new timestamp. A type that
+declares ``identity_fields`` keeps its first value: a later value with the same identity but
+different content is dropped. The
 in-memory store and delta machinery build on this.
 """
 
@@ -19,6 +21,8 @@ from .base import BaseDataPoint, identity_key
 class MergeKind(Enum):
     ADDED = 'added'  # a new (type, value) identity
     UPDATED = 'updated'  # an existing identity re-observed (last_retrieved bumped)
+    # A declared identity already held with a different value: the first value stands, this one is not stored.
+    DROPPED = 'dropped'
 
 
 @dataclass(frozen=True)
@@ -44,6 +48,8 @@ class DataPointSet:
         if existing is None:
             self._items[key] = data_point
             return MergeResult(MergeKind.ADDED, data_point)
+        if not existing.same_value(data_point):
+            return MergeResult(MergeKind.DROPPED, existing)
         merged = existing.reobserved(data_point.last_retrieved)
         self._items[key] = merged
         return MergeResult(MergeKind.UPDATED, merged)

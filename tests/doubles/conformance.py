@@ -28,7 +28,6 @@ from orcastork.exceptions import (
     LockHeldError,
     OptimisticConcurrencyError,
     StaleEpochError,
-    UnknownDataPointTypeError,
 )
 from orcastork.ids import Epoch, NamespaceId, OperatorId, Revision, SessionId
 from orcastork.ports import (
@@ -421,19 +420,17 @@ class InboxConformance:
         assert reclaimed.delivery_count == 2
         assert reclaimed.raw_payload == 'not-json{'  # kept for inspection
 
-    async def test_inbox_12_unknown_datapoint_type_propagates_from_consume_and_reclaim(
+    async def test_inbox_12_unknown_datapoint_type_is_delivered_as_poison(
         self, inbox: Inbox, append_raw: AppendRaw
     ) -> None:
-        # Poison is reserved for bad wire bytes. A well-formed payload whose DataPoint type this
-        # deployment does not know must fail fast — a quiet quarantine would hide a parser/registry
-        # regression — and stay deliverable, so redelivery on resume lets a newer deployment parse it.
-        await append_raw(SID, NEWER_DEPLOY_PAYLOAD)
-        with pytest.raises(UnknownDataPointTypeError):
-            await inbox.consume(SID)
-        with pytest.raises(UnknownDataPointTypeError):
-            await inbox.reclaim(SID)  # the claimed entry is re-presented, never quarantined
-        assert await inbox.quarantined(SID) == ()
-        assert await inbox.pending_count(SID) == 1  # still there for a newer deployment to apply
+        # A type a newer deploy delivered cannot be read here. Raising would fail every pass of the
+        # session, and leaving it unacked would hold the inbox open, so it is set aside like bad bytes.
+        known = await inbox.append(SID, work_email('a@e.example'))
+        unknown = await append_raw(SID, NEWER_DEPLOY_PAYLOAD)
+        delivered = await inbox.consume(SID)
+        assert {entry.entry_id: type(entry) for entry in delivered} == {known: InboxEntry, unknown: PoisonInboxEntry}
+        (reclaimed,) = [entry for entry in await inbox.reclaim(SID) if entry.entry_id == unknown]
+        assert isinstance(reclaimed, PoisonInboxEntry) and reclaimed.raw_payload == NEWER_DEPLOY_PAYLOAD
 
     async def test_inbox_12a_validation_failure_of_a_known_type_propagates(
         self, inbox: Inbox, append_raw: AppendRaw
