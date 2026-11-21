@@ -139,28 +139,24 @@ class SessionStateMirror:
         # Reproduces the store's merge semantics over the local state, including duplicates
         # within one batch: an identity added then re-observed in the same batch stays one
         # `added` row carrying its final timestamps; `last_retrieved` advances only when newer
-        # (`reobserved` keeps the max) and `first_retrieved` is immutable. A declared identity
-        # that arrives with a different value than the one held is dropped: the first value stands.
+        # (`reobserved` keeps the max) and `first_retrieved` is immutable.
         outcomes: list[MergeResult] = []
         added: dict[_IdentityKey, BaseDataPoint[Any]] = {}
         updated: dict[_IdentityKey, BaseDataPoint[Any]] = {}
         for data_point in data_points:
             key = identity_key(data_point)
-            pending = added if key in added else updated if key in updated else None
-            if pending is not None:
-                if not pending[key].same_value(data_point):
-                    outcomes.append(MergeResult(MergeKind.DROPPED, pending[key]))
-                    continue
-                pending[key] = pending[key].reobserved(data_point.last_retrieved)
-                outcomes.append(MergeResult(MergeKind.UPDATED, pending[key]))
+            if key in added:
+                added[key] = added[key].reobserved(data_point.last_retrieved)
+                outcomes.append(MergeResult(MergeKind.UPDATED, added[key]))
+                continue
+            if key in updated:
+                updated[key] = updated[key].reobserved(data_point.last_retrieved)
+                outcomes.append(MergeResult(MergeKind.UPDATED, updated[key]))
                 continue
             existing = self._entries.get(key)
             if existing is None:
                 added[key] = data_point
                 outcomes.append(MergeResult(MergeKind.ADDED, data_point))
-                continue
-            if not existing.data_point.same_value(data_point):
-                outcomes.append(MergeResult(MergeKind.DROPPED, existing.data_point))
                 continue
             merged = existing.data_point.reobserved(data_point.last_retrieved)
             outcomes.append(MergeResult(MergeKind.UPDATED, merged))

@@ -1568,16 +1568,6 @@ class Orchestrator:
         for signal, outcome in zip(emitted, result.outcomes, strict=True):
             if signal.operator_id is not None:
                 self._check_emission_declared(signal.operator_id, signal.data_point)
-            if outcome.kind is MergeKind.DROPPED:
-                # A declared identity already held with another value: the first value stands. Logged, never
-                # stored, audited or archived — the value the session holds is the one already recorded.
-                logger.warning(
-                    'DataPoint dropped: its identity is already held with a different value',
-                    session_id=self._session_id,
-                    operator_id=signal.operator_id,
-                    data_point_type=signal.data_point.type,
-                )
-                continue
             merge_kinds.append(outcome.kind.value)
             if not signal.data_point.audits_every_emission:
                 # A high-volume type: counted here and reported as one coalesced row, so hundreds of

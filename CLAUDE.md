@@ -108,9 +108,7 @@ session-scoped `Orchestrator` (supervised by a `SessionOrchestrationManager`) sc
   `_append_audit_entries`, bounded by `audit_timeout`; a failure is logged and dropped. Only a
   `StaleEpochError` propagates. Do not call `runtime.audit.append` directly from the orchestrator.
 - **A DataPoint identity is computed once**, at construction (`model_post_init`); an unhashable
-  value raises `UnhashableValueError` there, inside the emitting operator's fault boundary. A type
-  with `identity_fields` keeps its first value: every merge path (mirror, `DataPointSet`, both stores'
-  `write`) must return `MergeKind.DROPPED` for a different value, never overwrite it.
+  value raises `UnhashableValueError` there, inside the emitting operator's fault boundary.
 - **An unknown DataPoint type never fails a session.** Redis store reads skip it; inbox delivery
   surfaces it as poison so it is quarantined rather than left pending (a pending entry holds the
   completion tail's inbox re-check open forever).

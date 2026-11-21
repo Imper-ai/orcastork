@@ -184,7 +184,7 @@ actually write.
 
 | Concept | Role |
 |---|---|
-| `DataPoint` | The unit of data — a frozen, discriminated-union model; identity is `(type, value)` excluding timestamps, so re-observation dedups (keyed-merge). A type may narrow its identity to named fields of its value (`DataPointTypeConfig(identity_fields=('index',))`): the first value for an identity is kept, and a later, different one is dropped and logged. |
+| `DataPoint` | The unit of data — a frozen, discriminated-union model; identity is `(type, value)` excluding timestamps, so re-observation dedups (keyed-merge). |
 | `Operator` | Consumes/produces DataPoints (declares `depends_on` / `produces` / `requires` + a `policy`: rerun, debounce, timeout, retry); emits by `yield`. One shape for fetching, deriving and deciding alike. |
 | `Capability` | An injected action provider; declares its own deps; activated **lazily** when available (namespace-permitted + deps present + required caps available); resolved by the namespace's **preference order**; failed activations retry on a jittered cool-off. |
 | `Aggregator` | An `Operator` run in the aggregation phase; the **sole** writer of *curated* durable outputs (idempotent, OCC, dead-lettered on repeated failure). Aggregators run **concurrently**, each attempt timeout-bounded, with the lease renewed between attempts. |

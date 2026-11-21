@@ -27,7 +27,7 @@ import orjson
 from loguru import logger
 from redis.asyncio import Redis
 
-from ...datapoints import BaseDataPoint, DataPointView, identity_string, parse_data_point
+from ...datapoints import BaseDataPoint, DataPointView, canonical_value, parse_data_point
 from ...exceptions import StaleEpochError, UnknownDataPointTypeError
 from ...ids import Epoch, OperatorId, Revision, SessionId
 from ...ports.change_set import ChangeSet
@@ -148,9 +148,9 @@ class RedisDataPointStore:
 
     @staticmethod
     def _identity(data_point: BaseDataPoint[Any]) -> str:
-        # The shared string form of the keyed-merge identity (same normalization as the in-memory
-        # store), so dedup is identical across adapters.
-        return f'{data_point.type}\x00{identity_string(data_point)}'
+        # ``canonical_value`` is the shared string form of the keyed-merge identity (same normalization
+        # as the in-memory store and the archive), so dedup is identical across adapters.
+        return f'{data_point.type}\x00{canonical_value(data_point.value)}'
 
     @staticmethod
     def _keys(session_id: SessionId) -> tuple[str, str, str, str, str]:
@@ -185,7 +185,7 @@ class RedisDataPointStore:
                 triples += [identity, 'a', orjson.dumps(data_point.model_dump(mode='json')).decode()]
             else:
                 existing_dp = parse_data_point(orjson.loads(existing_raw))
-                if existing_dp.same_value(data_point) and data_point.last_retrieved > existing_dp.last_retrieved:
+                if data_point.last_retrieved > existing_dp.last_retrieved:
                     merged = existing_dp.reobserved(data_point.last_retrieved)
                     triples += [identity, 'u', orjson.dumps(merged.model_dump(mode='json')).decode()]
         return await self._apply(session_id, triples, epoch)

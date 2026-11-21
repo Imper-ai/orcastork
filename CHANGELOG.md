@@ -49,14 +49,10 @@ migration path.
   consumer can follow a session while it runs. No durability, resumability, epochs, inbox, parking,
   aggregators, audit, archive or telemetry. The `orcastork-lite-graph` CLI (`orcastork_lite.tools`)
   validates the cycle policy and renders Mermaid from the classes a module exposes.
-- **Identity by declared fields.** `DataPointTypeConfig(identity_fields=(...))` names the fields of a
-  mapping or pydantic-model value that make its identity. The first value for an identity is kept;
-  a later, different value is dropped (`MergeKind.DROPPED`) and logged. Without it, identity stays
-  the whole value.
 - **`build_redis_runtime`** (`orcastork.adapters.redis`): one client and one state TTL,
   wiring the store, inbox and lock, with no-op audit, archive and durable store ports.
 - **`NullAuditSink`, `NullDataPointArchive`, `NullDurableStore`** (`orcastork.ports`).
-- `UnhashableValueError`, `SessionStatus.RUNNING`, `DataPoint.identity`, `identity_string`.
+- `UnhashableValueError`, `SessionStatus.RUNNING`, `DataPoint.identity`.
 
 ### Fixed
 

@@ -1,10 +1,9 @@
 """LLS — what a session that lives for minutes to hours, across pods, relies on.
 
-The lease is renewed while operators run, a DataPoint type may declare its identity, a park
-rechecks the inbox, ``start_session`` never starts a second run of an existing session, and an
-audit sink that fails never stalls one. The scheduler fixes ported from ``orcastork_lite`` live
-here too: a hard session deadline, an armed retry made terminal, windows honoured while operators
-run, and identity computed once.
+The lease is renewed while operators run, a park rechecks the inbox, ``start_session`` never
+starts a second run of an existing session, and an audit sink that fails never stalls one. The
+scheduler fixes ported from ``orcastork_lite`` live here too: a hard session deadline, an armed
+retry made terminal, windows honoured while operators run, and identity computed once.
 """
 
 from __future__ import annotations
@@ -17,12 +16,13 @@ from typing import Any
 
 import pytest
 from fakeredis.aioredis import FakeRedis
+from pydantic import BaseModel
 
 from orcastork.adapters.memory import InMemoryAuditSink, InMemoryCapabilityCatalog, InMemoryInbox
 from orcastork.adapters.redis import RedisSessionLock, build_redis_runtime
 from orcastork.aggregation import RetryPolicy
 from orcastork.audit import AuditLogEntry
-from orcastork.datapoints import BaseDataPoint, DataPointEmission, DataPointSet, MergeKind
+from orcastork.datapoints import BaseDataPoint, DataPointEmission
 from orcastork.exceptions import UnhashableValueError
 from orcastork.flow import FlowDefinition
 from orcastork.ids import CapabilityId, Epoch, NamespaceId, OperatorId, SessionId
@@ -41,8 +41,6 @@ from .doubles.datapoints import (
     IpDataPoint,
     RawDataPoint,
     RiskDataPoint,
-    Turn,
-    TurnDataPoint,
     chat_answer,
     work_email,
 )
@@ -56,14 +54,9 @@ NAMESPACE = NamespaceId('lls-namespace')
 _GUARD_SECONDS = 5.0
 
 
-def _turn(index: int, kind: str) -> TurnDataPoint:
-    return TurnDataPoint(
-        value=Turn(index=index, kind=kind), retrieved_by=DEFAULT_OP, first_retrieved=T0, last_retrieved=T0
-    )
-
-
-def _turns(points: Iterable[BaseDataPoint[Any]]) -> set[tuple[int, str]]:
-    return {(point.value.index, point.value.kind) for point in points if isinstance(point, TurnDataPoint)}
+class Shape(BaseModel):
+    name: str
+    sides: int
 
 
 def _blocking_operator(
@@ -124,60 +117,27 @@ async def test_lls_01_an_operator_running_past_the_lock_ttl_keeps_its_session(
     assert result.operator_runs == {OperatorId('slow'): 1}
 
 
-# --- identity by declared fields ----------------------------------------------------------------------------
-
-
-def test_lls_02_a_declared_identity_keeps_its_first_value() -> None:
-    points = DataPointSet([_turn(0, 'wait')])
-    assert points.add(_turn(0, 'auto')).kind is MergeKind.DROPPED
-    assert points.add(_turn(0, 'wait')).kind is MergeKind.UPDATED  # the identical value still refreshes
-    assert _turns(points) == {(0, 'wait')}
-
-
-@pytest.mark.parametrize('backend', ['memory', 'redis'])
-async def test_lls_03_two_values_with_one_declared_identity_store_one_data_point(
-    backend: str, fake_clock: FakeClock, redis_client: FakeRedis
-) -> None:
-    runtime = (
-        build_in_memory_runtime(fake_clock)
-        if backend == 'memory'
-        else build_redis_runtime(redis_client, clock=fake_clock)
-    )
-    walk = make_operator(
-        'walk',
-        depends_on={EmailDataPoint},
-        produces={TurnDataPoint},
-        emits=[TurnDataPoint.emit(Turn(index=0, kind='auto')), TurnDataPoint.emit(Turn(index=1, kind='auto'))],
-    )
-    with capture_logs() as records:
-        result = await _orchestrator(runtime, [walk], seed=[work_email(), _turn(0, 'wait')]).run()
-
-    assert result.status is SessionStatus.COMPLETED
-    assert _turns((await runtime.store.snapshot(SID)).all()) == {(0, 'wait'), (1, 'auto')}
-    assert any('identity is already held' in record['message'] for record in records)
-
-
 # --- identity computed once, unhashable values refused (ported from lite) -----------------------------------
 
 
-def test_lls_04_identity_is_computed_once_and_survives_reobservation() -> None:
-    point = _turn(3, 'wait')
+def test_lls_02_identity_is_computed_once_and_survives_reobservation() -> None:
+    point = work_email('a@e.example')
     assert point.identity is point.identity
-    assert point.reobserved(T0 + timedelta(seconds=1)).identity == point.identity == ('turn', (('index', 3),))
+    assert point.reobserved(T0 + timedelta(seconds=1)).identity == point.identity == ('work_email', 'a@e.example')
 
 
-def test_lls_05_mixed_sets_and_model_values_get_a_stable_identity() -> None:
+def test_lls_03_mixed_sets_and_model_values_get_a_stable_identity() -> None:
     def raw(value: Any) -> RawDataPoint:
         return RawDataPoint(value=value, retrieved_by=DEFAULT_OP, first_retrieved=T0, last_retrieved=T0)
 
     assert raw({1, 'a', (2, 3)}) == raw({(2, 3), 'a', 1})
-    assert raw(Turn(index=1, kind='a')) == raw(Turn(index=1, kind='a'))
-    assert raw(Turn(index=1, kind='a')) != raw(Turn(index=1, kind='b'))
+    assert raw(Shape(name='tri', sides=3)) == raw(Shape(name='tri', sides=3))
+    assert raw(Shape(name='tri', sides=3)) != raw(Shape(name='square', sides=4))
     with pytest.raises(UnhashableValueError, match='bytearray'):
         raw({'nested': [bytearray(b'x')]})
 
 
-async def test_lls_06_an_unhashable_emission_fails_only_its_operator(fake_clock: FakeClock) -> None:
+async def test_lls_04_an_unhashable_emission_fails_only_its_operator(fake_clock: FakeClock) -> None:
     runtime = build_in_memory_runtime(fake_clock)
     careless = make_operator(
         'careless', depends_on={EmailDataPoint}, produces={RawDataPoint}, emits=[RawDataPoint.emit(bytearray(b'x'))]
@@ -201,7 +161,7 @@ class _RevocableCatalog(InMemoryCapabilityCatalog):
         self._permitted[namespace_id] = frozenset()
 
 
-async def test_lls_07_an_armed_retry_becomes_terminal_when_its_operator_loses_readiness(fake_clock: FakeClock) -> None:
+async def test_lls_05_an_armed_retry_becomes_terminal_when_its_operator_loses_readiness(fake_clock: FakeClock) -> None:
     intel = make_capability('intel')
     catalog = _RevocableCatalog(permitted={NAMESPACE: {CapabilityId('intel')}})
 
@@ -232,7 +192,7 @@ async def test_lls_07_an_armed_retry_becomes_terminal_when_its_operator_loses_re
 # --- a hard session deadline (ported from lite) -------------------------------------------------------------
 
 
-async def test_lls_08_the_session_deadline_is_hard_while_operators_run(fake_clock: FakeClock) -> None:
+async def test_lls_06_the_session_deadline_is_hard_while_operators_run(fake_clock: FakeClock) -> None:
     # Nothing advances the fake clock, so only the run's timeout, clipped to the budget left, can end it.
     sleeper = make_operator('sleeper', depends_on={EmailDataPoint}, sleep_after=_GUARD_SECONDS)
     quick = make_operator(
@@ -247,7 +207,7 @@ async def test_lls_08_the_session_deadline_is_hard_while_operators_run(fake_cloc
     assert RiskDataPoint in {type(point) for point in (await runtime.store.snapshot(SID)).all()}
 
 
-async def test_lls_09_an_operator_that_finishes_during_the_last_pass_is_recorded(fake_clock: FakeClock) -> None:
+async def test_lls_07_an_operator_that_finishes_during_the_last_pass_is_recorded(fake_clock: FakeClock) -> None:
     peer_may_finish = asyncio.Event()
 
     class SlowA(Operator):
@@ -291,7 +251,7 @@ async def test_lls_09_an_operator_that_finishes_during_the_last_pass_is_recorded
 # --- armed windows honoured while operators run (ported from lite) ------------------------------------------
 
 
-async def test_lls_10_an_armed_window_fires_while_a_silent_operator_is_still_running(fake_clock: FakeClock) -> None:
+async def test_lls_08_an_armed_window_fires_while_a_silent_operator_is_still_running(fake_clock: FakeClock) -> None:
     # The blocker never emits and outlives the session, so the rerunner's window can only come due if the
     # loop honours it while the blocker is in flight. The deadline, which clips the blocker, ends the session.
     blocker = make_operator('blocker', depends_on={EmailDataPoint}, sleep_after=_GUARD_SECONDS)
@@ -335,7 +295,7 @@ class _DeliversAsTheSessionParks(InMemoryInbox):
                 await self.append(session_id, late)
 
 
-async def test_lls_11_a_delivery_landing_as_the_session_parks_is_processed(fake_clock: FakeClock) -> None:
+async def test_lls_09_a_delivery_landing_as_the_session_parks_is_processed(fake_clock: FakeClock) -> None:
     runtime = replace(build_in_memory_runtime(fake_clock), inbox=_DeliversAsTheSessionParks(chat_answer('late')))
     scorer = make_operator(
         'scorer', depends_on={ChatAnswerDataPoint}, produces={RiskDataPoint}, emits=[RiskDataPoint.emit(0.3)]
@@ -359,7 +319,7 @@ def _counting_scorer(runs: list[int]) -> type[Operator]:
     return make_operator('scorer', depends_on={EmailDataPoint}, produces={RiskDataPoint}, emit_factory=score)
 
 
-async def test_lls_12_start_session_returns_a_completed_session_as_it_is(fake_clock: FakeClock) -> None:
+async def test_lls_10_start_session_returns_a_completed_session_as_it_is(fake_clock: FakeClock) -> None:
     runtime = build_in_memory_runtime(fake_clock)
     manager = SessionOrchestrationManager(runtime)
     runs: list[int] = []
@@ -373,7 +333,7 @@ async def test_lls_12_start_session_returns_a_completed_session_as_it_is(fake_cl
     assert runs == [1] and await runtime.lock.current_epoch(SID) == 1  # no second run, no new epoch
 
 
-async def test_lls_13_start_session_returns_a_live_session_as_running(fake_clock: FakeClock) -> None:
+async def test_lls_11_start_session_returns_a_live_session_as_running(fake_clock: FakeClock) -> None:
     runtime = build_in_memory_runtime(fake_clock)
     manager = SessionOrchestrationManager(runtime)
     started, release = asyncio.Event(), asyncio.Event()
@@ -390,7 +350,7 @@ async def test_lls_13_start_session_returns_a_live_session_as_running(fake_clock
     assert (await live).status is SessionStatus.COMPLETED
 
 
-async def test_lls_14_start_session_resumes_a_parked_session(fake_clock: FakeClock) -> None:
+async def test_lls_12_start_session_resumes_a_parked_session(fake_clock: FakeClock) -> None:
     runtime = build_in_memory_runtime(fake_clock)
     manager = SessionOrchestrationManager(runtime)
     scorer = make_operator(
@@ -407,7 +367,7 @@ async def test_lls_14_start_session_resumes_a_parked_session(fake_clock: FakeClo
     assert resumed.operator_runs == {OperatorId('scorer'): 1}
 
 
-async def test_lls_15_start_session_starts_a_session_with_no_state(fake_clock: FakeClock) -> None:
+async def test_lls_13_start_session_starts_a_session_with_no_state(fake_clock: FakeClock) -> None:
     manager = SessionOrchestrationManager(build_in_memory_runtime(fake_clock))
     runs: list[int] = []
     flow = FlowDefinition(name='lls-flow', operators=(_counting_scorer(runs),))
@@ -437,7 +397,7 @@ class _HangingAudit(InMemoryAuditSink):
 
 
 @pytest.mark.parametrize('sink', [InMemoryAuditSink, _RaisingAudit, _HangingAudit])
-async def test_lls_16_a_failing_or_hanging_audit_sink_leaves_the_result_unchanged(
+async def test_lls_14_a_failing_or_hanging_audit_sink_leaves_the_result_unchanged(
     sink: Callable[[], InMemoryAuditSink], fake_clock: FakeClock
 ) -> None:
     runtime = replace(build_in_memory_runtime(fake_clock), audit=sink())
@@ -457,7 +417,7 @@ async def test_lls_16_a_failing_or_hanging_audit_sink_leaves_the_result_unchange
 # --- one INFO per flow --------------------------------------------------------------------------------------
 
 
-async def test_lls_17_the_completion_tail_logs_its_steps_at_debug(fake_clock: FakeClock) -> None:
+async def test_lls_15_the_completion_tail_logs_its_steps_at_debug(fake_clock: FakeClock) -> None:
     scorer = make_operator(
         'scorer', depends_on={EmailDataPoint}, produces={RiskDataPoint}, emits=[RiskDataPoint.emit(0.4)]
     )
