@@ -154,7 +154,13 @@ class SessionOrchestrationManager:
     ) -> OrchestratorResult:
         """Spawn a fresh orchestrator for a new session (mints epoch 1, injects the catalog).
 
-        When a scheduling gate is configured the start is enforced here, keyed on ``gate_key``
+        Starting a session that already exists never starts another run of it: a completed session
+        is returned as it is (``COMPLETED``), a live one as ``RUNNING`` (also when a concurrent start
+        wins the acquire), and a parked or orphaned one is resumed — without the seed, which it already
+        holds. Only a session with no state at all is new. A result returned without a run carries the
+        session's current epoch and no operator runs.
+
+        When a scheduling gate is configured a new start is enforced here, keyed on ``gate_key``
         (defaulting to the namespace): a start still cooling down raises
         :class:`SchedulingGateBlockedError`. Enforcement lives in the manager so a caller
         cannot bypass the cooldown, and the gate's check-and-arm is atomic so concurrent
@@ -163,7 +169,16 @@ class SessionOrchestrationManager:
         with self._runtime.telemetry.tracer.start_as_current_span(
             'session.start',
             attributes={'session_id': session_id, 'namespace_id': namespace_id, 'flow_name': flow.name},
-        ):
+        ) as span:
+            existing = await self._existing_session(session_id, namespace_id, flow)
+            if existing is not None:
+                span.set_attribute('disposition', existing.status.value)
+                logger.debug(
+                    'Session start found an existing session; no new run was started',
+                    session_id=session_id,
+                    status=existing.status.value,
+                )
+                return existing
             logger.debug(
                 'Session start requested; spawning a fresh orchestrator for the new session',
                 session_id=session_id,
@@ -180,7 +195,34 @@ class SessionOrchestrationManager:
                     )
                     # Propagates through the span, so blocked starts are visible in traces.
                     raise SchedulingGateBlockedError(f'scheduling gate is cooling down for key {key!r}')
-            return await self._spawn_and_drain(session_id, namespace_id, flow, seed)
+            try:
+                return await self._spawn_and_drain(session_id, namespace_id, flow, seed)
+            except LockHeldError:
+                # A concurrent start won the acquire: the session is live on that caller.
+                span.set_attribute('disposition', SessionStatus.RUNNING.value)
+                return await self._session_as_found(session_id, SessionStatus.RUNNING)
+
+    async def _existing_session(
+        self, session_id: SessionId, namespace_id: NamespaceId, flow: FlowDefinition
+    ) -> OrchestratorResult | None:
+        """What ``start_session`` returns for a session that already exists, or ``None`` for a new one."""
+        if await self._runtime.lock.is_complete(session_id):
+            return await self._session_as_found(session_id, SessionStatus.COMPLETED)
+        if await self._runtime.lock.current_epoch(session_id) == _NEVER_MINTED_EPOCH:
+            return None
+        if await self._runtime.lock.is_held(session_id):
+            return await self._session_as_found(session_id, SessionStatus.RUNNING)
+        resumed = await self.resume(session_id=session_id, namespace_id=namespace_id, flow=flow)
+        if resumed is not None:
+            return resumed
+        # The resume stood down: the session completed or went live meanwhile.
+        completed = await self._runtime.lock.is_complete(session_id)
+        return await self._session_as_found(
+            session_id, SessionStatus.COMPLETED if completed else SessionStatus.RUNNING
+        )
+
+    async def _session_as_found(self, session_id: SessionId, status: SessionStatus) -> OrchestratorResult:
+        return OrchestratorResult(status, await self._runtime.lock.current_epoch(session_id), {})
 
     async def is_orphaned(self, session_id: SessionId) -> bool:
         """Orphaned iff the session was started, is not COMPLETED, and its ownership lock has expired."""

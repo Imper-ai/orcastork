@@ -43,9 +43,18 @@ rate limiter compose without ceremony.
 
 ## Redis: keyspace and TTLs
 
-**Give orcastork its own logical database or its own Redis.** The keys are *not* prefixed with
-anything of the library's own — they are `dp:{session_id}`, `lock:{session_id}` and so on. If
-you share a database with another workload that uses short keys, you own the collision.
+**Namespace your session ids, or give orcastork a database of its own.** The keys are
+`dp:{session_id}`, `lock:{session_id}` and so on, so every per-session key and channel embeds the
+session id. Session ids that carry a namespace of their own (`my_flow:{id}`) keep a flow's keys
+apart from another workload's in a shared database; bare ids risk colliding with another
+workload's short keys. The simplest wiring is the builder, which shares one client and one state
+TTL across the store, inbox and lock:
+
+```python
+from orcastork.adapters.redis import build_redis_runtime
+
+runtime = build_redis_runtime(redis, state_ttl_ms=172_800_000)
+```
 
 | Key | Holds |
 |---|---|
@@ -57,8 +66,9 @@ you share a database with another workload that uses short keys, you own the col
 | `wm:{session}` | Per-operator watermarks |
 | `fx:{session}` | Effect-guard claim/commit marks (`ctx.once`) |
 | `meta:{session}` | Session meta: wall-clock deadline, flow fingerprint |
-| `inbox:{session}` | Mid-session input (a Stream with a consumer group) |
-| `acked:{session}`, `quarantine:{session}` | Inbox acknowledgements and poison quarantine |
+| `inbox:{session}` | Mid-session input (a Stream with a consumer group); an entry is deleted once applied or quarantined |
+| `inbox-wakeup:{session}` | Pub/sub channel that wakes a session waiting on its inbox |
+| `inbox_epoch:{session}`, `quarantine:{session}` | Inbox fencing epoch and poison quarantine |
 | `cooldown:{key}` | The manager's scheduling gate |
 | `ratelimit:{key}` | Token-bucket state for capability pacing |
 
@@ -109,8 +119,9 @@ timing promise the framework cannot enforce for you:
 
 > **The lock TTL must exceed the longest single unrenewed await.**
 
-The gathering loop renews the lease as it goes (every `DEFAULT_LEASE_RENEW_INTERVAL`, 10s),
-and stops renewing when gathering returns. Everything after that — aggregate, flush, re-check
+The gathering loop renews the lease as it goes (every `DEFAULT_LEASE_RENEW_INTERVAL`, 10s) —
+between passes, while it waits on the inbox, and while operators run, so an operator may run
+longer than the TTL without losing its session — and stops renewing when gathering returns. Everything after that — aggregate, flush, re-check
 the inbox, mark complete — runs on the lease it already holds. Each of those steps is
 individually bounded by `operation_timeout` and raises `CompletionTailTimeoutError` rather
 than overrunning silently, so the rule in practice is:
@@ -134,8 +145,8 @@ its full budget therefore expires the lease at the same instant it gives up. Rai
 lock = RedisSessionLock(redis, ttl_ms=60_000)   # 2x the 30s operation_timeout
 ```
 
-Any per-operator `OperatorPolicy.timeout` larger than `operation_timeout` raises the bar
-further — the TTL has to clear the largest of them, not the global default.
+A per-operator `OperatorPolicy.timeout` does not raise the bar: operators run under the
+loop's renewals. Only the unrenewed tail steps, each bounded by `operation_timeout`, do.
 
 Do **not** reach for a background keepalive to widen the margin. Renewing from a task that is
 not the one doing the work turns the lease from "this session is progressing" into "this
@@ -156,7 +167,9 @@ What each process must do:
 - **Run the same code.** A `FlowDefinition`'s fingerprint is checked on resume; a process
   running a different graph is detected as drift rather than quietly resuming into the wrong
   flow. Expect drift errors during a rolling deploy that changes a flow, and plan the rollout
-  accordingly.
+  accordingly. A DataPoint type is the exception: a process that meets a stored or delivered
+  type it does not know skips it with a warning (a delivered one is quarantined), so adding a
+  type can still be rolled back. Never reshape or remove a type a live session may hold.
 - **Call `resume` for orphaned sessions on some schedule.** A crashed or parked session is
   re-driven when someone asks; the manager does not poll on its own.
 
@@ -197,7 +210,7 @@ renders the graph to stdout, which is worth committing to your own docs.
 
 ## Pre-flight checklist
 
-- [ ] Redis has its own logical database (the keys are unprefixed)
+- [ ] Session ids carry a namespace, or Redis has its own logical database
 - [ ] Redis persistence matches how much in-flight state you can afford to lose
 - [ ] `ttl_ms > operation_timeout` — the defaults are both 30s, i.e. no headroom
 - [ ] The archive has a retention configured, or you have accepted unbounded growth

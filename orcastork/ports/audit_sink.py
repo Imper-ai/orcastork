@@ -42,3 +42,16 @@ class AuditSink(Protocol):
     async def replay(self, session_id: SessionId) -> tuple[AuditLogEntry, ...]:
         """Every entry appended for the session, in append order."""
         ...
+
+
+class NullAuditSink:
+    """No-op sink — the default for a deployment that keeps no audit trail. ``replay`` returns nothing."""
+
+    async def append(self, entry: AuditLogEntry) -> None:  # noqa: ARG002
+        return None
+
+    async def append_many(self, entries: Sequence[AuditLogEntry]) -> None:  # noqa: ARG002
+        return None
+
+    async def replay(self, session_id: SessionId) -> tuple[AuditLogEntry, ...]:  # noqa: ARG002
+        return ()

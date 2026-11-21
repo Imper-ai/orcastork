@@ -11,19 +11,24 @@ of interleaving (the script treats the DataPoint JSON as an opaque blob, so it n
 decode it). ``apply_resolved`` runs the same script without the ``write`` path's prior
 HGETALL: a sole-mutator caller that already resolved the merge supplies the 'a'/'u' mode per
 identity itself, so the hot write path costs one round-trip instead of a full re-read.
+
+A stored DataPoint whose type this process has no leaf for (a newer deploy wrote it) is skipped with a
+warning on every read rather than failing the whole session; no write ever touches its field.
 """
 
 from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
 import orjson
+from loguru import logger
 from redis.asyncio import Redis
 
 from ...datapoints import BaseDataPoint, DataPointView, canonical_value, parse_data_point
-from ...exceptions import StaleEpochError
+from ...exceptions import StaleEpochError, UnknownDataPointTypeError
 from ...ids import Epoch, OperatorId, Revision, SessionId
 from ...ports.change_set import ChangeSet
 from ...ports.datapoint_store import EffectClaim
@@ -118,6 +123,14 @@ end
 return 0
 """
 
+
+@dataclass(frozen=True)
+class _StoredEntry:
+    data_point: BaseDataPoint[Any]
+    added: int
+    updated: int
+
+
 _CLAIM_RESULTS = {
     1: EffectClaim.ACQUIRED,
     2: EffectClaim.ALREADY_COMMITTED,
@@ -148,6 +161,15 @@ class RedisDataPointStore:
             f'added:{session_id}',
             f'upd:{session_id}',
         )
+
+    def _parse(self, session_id: SessionId, raw: str) -> BaseDataPoint[Any] | None:
+        try:
+            return parse_data_point(orjson.loads(raw))
+        except UnknownDataPointTypeError:
+            # A newer deploy's type: this process cannot read it, and no operator here consumes it, so
+            # the rest of the session is still readable. Rolling back past a new type stays possible.
+            logger.warning('Skipped a stored DataPoint of a type this process does not know', session_id=session_id)
+            return None
 
     async def write(
         self, session_id: SessionId, data_points: Iterable[BaseDataPoint[Any]], *, epoch: Epoch
@@ -211,18 +233,20 @@ class RedisDataPointStore:
         )
         return Revision(int(result))
 
-    async def _entries(self, session_id: SessionId) -> list[dict[str, Any]]:
+    async def _entries(self, session_id: SessionId) -> list[_StoredEntry]:
         _, _, dp_key, added_key, upd_key = self._keys(session_id)
         dps = await self._redis.hgetall(dp_key)
         added = await self._redis.hgetall(added_key)
         updated = await self._redis.hgetall(upd_key)
-        return [
-            {'dp': orjson.loads(raw), 'added': int(added.get(identity, 0)), 'updated': int(updated.get(identity, 0))}
-            for identity, raw in dps.items()
-        ]
+        entries: list[_StoredEntry] = []
+        for identity, raw in dps.items():
+            data_point = self._parse(session_id, raw)
+            if data_point is not None:
+                entries.append(_StoredEntry(data_point, int(added.get(identity, 0)), int(updated.get(identity, 0))))
+        return entries
 
     async def snapshot(self, session_id: SessionId) -> DataPointView:
-        return DataPointView(parse_data_point(entry['dp']) for entry in await self._entries(session_id))
+        return DataPointView(entry.data_point for entry in await self._entries(session_id))
 
     async def revision(self, session_id: SessionId) -> Revision:
         _, rev_key, _, _, _ = self._keys(session_id)
@@ -232,11 +256,10 @@ class RedisDataPointStore:
         added: list[BaseDataPoint[Any]] = []
         updated: list[BaseDataPoint[Any]] = []
         for entry in await self._entries(session_id):
-            data_point = parse_data_point(entry['dp'])
-            if entry['added'] > since:
-                added.append(data_point)
-            elif entry['updated'] > since:
-                updated.append(data_point)
+            if entry.added > since:
+                added.append(entry.data_point)
+            elif entry.updated > since:
+                updated.append(entry.data_point)
         return ChangeSet(added=tuple(added), updated=tuple(updated))
 
     async def get_watermark(self, session_id: SessionId, operator_id: OperatorId) -> Revision | None:
@@ -248,7 +271,13 @@ class RedisDataPointStore:
     ) -> None:
         epoch_key, _, _, _, _ = self._keys(session_id)
         result = await self._redis.eval(
-            _GUARDED_FIELD_SCRIPT, 2, epoch_key, f'wm:{session_id}', str(int(epoch)), operator_id, str(int(revision))
+            _GUARDED_FIELD_SCRIPT,
+            2,
+            epoch_key,
+            f'wm:{session_id}',
+            str(int(epoch)),
+            operator_id,
+            str(int(revision)),
         )
         if int(result) == -1:
             raise StaleEpochError(f'epoch {epoch} is stale for session {session_id}')

@@ -308,8 +308,12 @@ result = await manager.start_session(
 > semantics (drift is fingerprint-detected and audited). You can also construct an
 > `Orchestrator` directly (see the tests) — the manager just adds epoch minting, the
 > scheduling gate, and orphan-resume on top. For production wiring, swap
-> `build_in_memory_runtime` for a Redis+Mongo runtime; the operators/capabilities/aggregators
-> are identical across backends.
+> `build_in_memory_runtime` for `orcastork.adapters.redis.build_redis_runtime(redis, state_ttl_ms=...)`
+> (store, inbox and lock in Redis; pass Mongo-backed ports for the rest if you keep them); the
+> operators/capabilities/aggregators are identical across backends.
+>
+> `start_session` never starts a second run of a session that exists: a completed one comes back
+> as it is (`COMPLETED`), a live one as `RUNNING`, and a parked or orphaned one is resumed.
 
 Operators, capabilities, and aggregators are passed as **classes**, not instances — the
 orchestrator constructs a fresh, no-argument instance each time it runs one. **They must be
@@ -1152,7 +1156,7 @@ the map:
 | `DataPointStore` | Session-scoped, keyed-merge, monotonic-revision blackboard **+ the session's epoch-fenced meta state** (watermarks, effect marks, wall-clock deadline, flow fingerprint). | `write`, `apply_resolved` (a sole-mutator's pre-resolved batch), `snapshot`, `revision`, `change_set_since`, `get/set_watermark`, `claim/commit/revert_effect`, `get_effect_state`, `get/set_session_deadline`, `get/set_flow_fingerprint` |
 | `Inbox` | Durable, ordered, at-least-once ingestion of user-action DataPoints, + a push wakeup for waiting sessions; poison-tolerant delivery + quarantine. | `append`, `consume`, `reclaim`, `ack`, `quarantine`, `quarantined`, `pending_count`, `wait_for_entry` |
 | `SessionLock` | Liveness lock **+ fencing epoch** (correctness) **+ completion flag**. | `acquire`→`Epoch`, `renew`, `release`, `current_epoch`, `is_held`, `mark_complete`, `is_complete` |
-| `AuditSink` | Durable, append-only event log; an append is replayable by the time it returns. | `append`, `append_many` (one batch, atomically fenced), `replay` |
+| `AuditSink` | Durable, append-only event log; an append is replayable by the time it returns. The orchestrator bounds each write (`audit_timeout`) and logs and drops one that fails, so the audit never stalls a session; `NullAuditSink` keeps none. | `append`, `append_many` (one batch, atomically fenced), `replay` |
 | `DurableStore` | Idempotent, OCC-guarded *curated* durable outputs, routed to the output model's `__table_name__`, + contribution markers. | `read`, `upsert`, `add_to_set` (all by `table`), `mark_contribution`, `is_contribution_marked` |
 | `DataPointArchive` | Second durable write path: live, keyed-upsert raw DataPoints (off the hot path; PII sealed via an injected `ValueCipher`). | `archive`, `archive_many` (one batch, atomically fenced), `flush`, `read`, `buffered_count` |
 | `CapabilityCatalog` | Per-namespace permitted capabilities **and operators** + credentials + provider preference. | `permitted_capabilities`, `permitted_operators` (`None` = unrestricted), `credentials`, `preferred_order` |
@@ -1169,8 +1173,11 @@ families:
   `build_in_memory_runtime()`.
 - **redis** — `redis.asyncio` directly: Lua-CAS store (incl. `apply_resolved` and the effect
   keyspace), Streams inbox (consumer group + `XAUTOCLAIM`, poison-tolerant, durable
-  quarantine), `SET NX PX` lease + monotonic `INCR` epoch, cooldown gate, atomic Lua
-  token-bucket rate limiter.
+  quarantine, trimmed as it is applied), `SET NX PX` lease + monotonic `INCR` epoch, cooldown
+  gate, atomic Lua token-bucket rate limiter. `build_redis_runtime` wires the store, inbox and
+  lock with one client and one state TTL (no-op audit, archive and durable store unless you pass
+  your own). A DataPoint of a type the process does not know is skipped with a warning on every
+  read, so a deploy that adds a type can roll back.
 - **mongo** — `pymongo` async directly: OCC version-guarded durable store, append-only audit sink
   (`append_many` allocates a contiguous sequence range under a **single meta CAS**, fencing
   the whole batch at once, then writes it straight to `orcastork-audit-log`), keyed-upsert

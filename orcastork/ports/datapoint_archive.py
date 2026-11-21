@@ -58,3 +58,22 @@ class DataPointArchive(Protocol):
     async def buffered_count(self, session_id: SessionId) -> int:
         """Entries appended but not yet flushed."""
         ...
+
+
+class NullDataPointArchive:
+    """No-op archive — for a deployment that keeps no history of what its sessions observed."""
+
+    async def archive(self, entry: ArchivedDataPoint) -> None:  # noqa: ARG002
+        return None
+
+    async def archive_many(self, entries: Sequence[ArchivedDataPoint]) -> None:  # noqa: ARG002
+        return None
+
+    async def flush(self, session_id: SessionId) -> int:  # noqa: ARG002
+        return 0
+
+    async def read(self, session_id: SessionId) -> tuple[ArchivedDataPoint, ...]:  # noqa: ARG002
+        return ()
+
+    async def buffered_count(self, session_id: SessionId) -> int:  # noqa: ARG002
+        return 0

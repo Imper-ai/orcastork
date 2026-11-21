@@ -74,3 +74,39 @@ class DurableStore(Protocol):
         the re-aggregation's mark_contribution call is epoch-fenced against any stale predecessor.
         """
         ...
+
+
+class NullDurableStore:
+    """No-op durable store — for a flow with no aggregators, which never writes curated output.
+
+    Nothing is kept: a read finds nothing and a contribution is never recorded as marked, so an
+    aggregator wired against it would rerun on every resume.
+    """
+
+    async def read(self, table: str, key: str) -> VersionedDocument | None:  # noqa: ARG002
+        return None
+
+    async def upsert(
+        self,
+        table: str,  # noqa: ARG002
+        key: str,  # noqa: ARG002
+        document: dict[str, Any],  # noqa: ARG002
+        *,
+        expected_version: int,
+        epoch: Epoch,  # noqa: ARG002
+        status: str | None = None,  # noqa: ARG002
+        updated_at: datetime | None = None,  # noqa: ARG002
+    ) -> int:
+        return expected_version + 1
+
+    async def add_to_set(self, table: str, key: str, field_name: str, value: str, *, epoch: Epoch) -> int:  # noqa: ARG002
+        return 1
+
+    async def mark_contribution(self, session_id: SessionId, operator_id: OperatorId, *, epoch: Epoch) -> bool:  # noqa: ARG002
+        return True
+
+    async def is_contribution_marked(self, session_id: SessionId, operator_id: OperatorId) -> bool:  # noqa: ARG002
+        return False
+
+    async def clear_contribution(self, session_id: SessionId, operator_id: OperatorId) -> None:  # noqa: ARG002
+        return None

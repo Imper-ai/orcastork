@@ -22,25 +22,30 @@ from orcastork.adapters.redis import (
     RedisRateLimiter,
     RedisSessionLock,
     RedisStreamsInbox,
+    build_redis_runtime,
 )
 from orcastork.exceptions import StaleEpochError
-from orcastork.ids import Epoch, OperatorId, Revision, SessionId
+from orcastork.ids import Epoch, NamespaceId, OperatorId, Revision, SessionId
+from orcastork.orchestrator import Orchestrator, SessionStatus
 from orcastork.ports import CooldownGate, DataPointStore, Inbox, InboxEntry, SessionLock
 
 from ..doubles.clock import FakeClock
 from ..doubles.conformance import (
+    NEWER_DEPLOY_PAYLOAD,
     AppendRaw,
     CooldownGateConformance,
     InboxConformance,
     LockConformance,
     StoreConformance,
 )
-from ..doubles.datapoints import T0, personal_email, work_email
+from ..doubles.datapoints import T0, ChatAnswerDataPoint, chat_answer, personal_email, work_email
+from ..doubles.logs import capture_logs
 from ..doubles.redis_support import TimeControlledServer
 
 RZ = SessionId('rz-session')
 RZ_OTHER = SessionId('rz-other-session')
 RZ_OP = OperatorId('rz-op')
+RZ_NAMESPACE = NamespaceId('rz-namespace')
 T2 = T0 + timedelta(hours=2)
 
 
@@ -418,3 +423,79 @@ async def test_rz_27_reclaim_keeps_distinct_counts_for_concurrently_pending_entr
     reclaimed = await inbox.reclaim(RZ)  # one XAUTOCLAIM re-presents both, across the id range
     counts = {entry.entry_id: entry.delivery_count for entry in reclaimed}
     assert counts == {e1: 3, e2: 2}  # each entry mapped to its OWN times_delivered, never a shared count
+
+
+# --- 0.2.0: one runtime builder, a trimmed inbox, unknown types skipped ------------------------------
+
+
+class TestBuiltRedisStore(StoreConformance):
+    @pytest.fixture
+    def store(self, redis_client: FakeRedis) -> DataPointStore:
+        return build_redis_runtime(redis_client).store
+
+
+class TestBuiltRedisInbox(InboxConformance):
+    @pytest.fixture
+    def inbox(self, redis_client: FakeRedis) -> Inbox:
+        return build_redis_runtime(redis_client).inbox
+
+    @pytest.fixture
+    def append_raw(self, redis_client: FakeRedis) -> AppendRaw:
+        async def _append(session_id: SessionId, payload: str) -> str:
+            return str(await redis_client.xadd(f'inbox:{session_id}', {'data': payload}))
+
+        return _append
+
+
+class TestBuiltRedisSessionLock(LockConformance):
+    @pytest.fixture
+    def lock(self, redis_client: FakeRedis) -> SessionLock:
+        return build_redis_runtime(redis_client).lock
+
+    @pytest.fixture
+    def advance_time(self, redis_server: TimeControlledServer) -> Callable[[float], None]:
+        return redis_server.advance
+
+
+async def test_rz_28_an_applied_inbox_is_trimmed_and_expires(redis_client: FakeRedis) -> None:
+    runtime = build_redis_runtime(redis_client, clock=FakeClock())
+    for index in range(3):
+        await runtime.inbox.append(RZ, chat_answer(f'answer-{index}'))
+
+    result = await Orchestrator(
+        session_id=RZ,
+        namespace_id=RZ_NAMESPACE,
+        runtime=runtime,
+        operators=[],
+        completes_when=ChatAnswerDataPoint,
+    ).run()
+
+    assert result.status is SessionStatus.COMPLETED
+    assert await redis_client.xlen(f'inbox:{RZ}') == 0  # none of the applied deliveries stay
+    assert await redis_client.pttl(f'inbox:{RZ}') > 0
+    assert await runtime.inbox.pending_count(RZ) == 0
+
+
+async def test_rz_29_a_stream_created_by_a_consume_expires(redis_client: FakeRedis) -> None:
+    inbox = RedisStreamsInbox(redis_client, state_ttl_ms=60_000)
+    assert await inbox.consume(RZ) == ()
+    assert await redis_client.pttl(f'inbox:{RZ}') > 0
+
+
+async def test_rz_31_a_stored_data_point_of_an_unknown_type_is_skipped(redis_client: FakeRedis) -> None:
+    raw: Any = redis_client  # redis-py types its commands as a sync/async union
+    store = RedisDataPointStore(redis_client)
+    await store.write(RZ, [work_email('a@e.example')], epoch=Epoch(1))
+    await raw.hset(f'dp:{RZ}', 'type_from_a_newer_deploy\x00x', NEWER_DEPLOY_PAYLOAD)
+    await raw.hset(f'added:{RZ}', 'type_from_a_newer_deploy\x00x', 2)
+
+    with capture_logs() as records:
+        snapshot = await store.snapshot(RZ)
+        changes = await store.change_set_since(RZ, Revision(0))
+
+    assert [point.value for point in snapshot.all()] == ['a@e.example']
+    assert [point.value for point in changes.added] == ['a@e.example']
+    assert any('does not know' in record['message'] for record in records)
+    # A write never touches the unknown field.
+    await store.write(RZ, [personal_email('b@e.example')], epoch=Epoch(1))
+    assert await raw.hget(f'dp:{RZ}', 'type_from_a_newer_deploy\x00x') == NEWER_DEPLOY_PAYLOAD

@@ -63,6 +63,14 @@ session-scoped `Orchestrator` (supervised by a `SessionOrchestrationManager`) sc
   `NullRateLimiter` (a no-op) so a deployment that wires nothing loses nothing.
 - **PII** is sealed through an injected `ValueCipher` (default `NullCipher`); the framework ships
   no cryptography itself — the embedding flow wires real encryption.
+- **The lease is renewed by the gathering loop itself**, between passes, through the inbox wait, and
+  while operators run: with operators in flight the loop's wait for their next signal is bounded by
+  the renew interval, and a wait that times out renews. That timeout is an event-loop timeout like an
+  operator's own (`asyncio.wait`), not an injected-clock sleep: a `FakeClock` sleep fast-forwards the
+  moment it starts, so racing one against operators that finish without waiting would charge its full
+  width to every pass. Armed debounce/retry windows, which ARE scheduled time, race on the injected
+  clock. The renewal does not make a wedged operator look healthy: every run is bounded by its timeout,
+  clipped to the session budget left, so the session deadline is hard.
 - **The completion tail is BOUNDED, not renewed.** The loop's renews stop when gathering returns, so
   `aggregate → flush → inbox re-check → mark_complete` holds the epoch with nothing renewing it, and the
   lock's TTL is specified to exceed the longest single unrenewed await. A slow durable write in the tail
@@ -94,7 +102,16 @@ session-scoped `Orchestrator` (supervised by a `SessionOrchestrationManager`) sc
   gather pass and shared with `_plan`: abandoning a window and breaking to aggregation must be
   decided against the same view, or a refold is dropped by a pass that then waits instead.
 - **Manager API is flow-based** — `start_session`/`resume`/`deliver` take a `FlowDefinition`
-  (`flow.py`); its fingerprint backs resume drift detection.
+  (`flow.py`); its fingerprint backs resume drift detection. `start_session` on an existing session
+  never runs it again: completed is returned as found, live as `RUNNING`, parked/orphaned is resumed.
+- **The audit never stalls a session.** Every orchestrator audit write goes through
+  `_append_audit_entries`, bounded by `audit_timeout`; a failure is logged and dropped. Only a
+  `StaleEpochError` propagates. Do not call `runtime.audit.append` directly from the orchestrator.
+- **A DataPoint identity is computed once**, at construction (`model_post_init`); an unhashable
+  value raises `UnhashableValueError` there, inside the emitting operator's fault boundary.
+- **An unknown DataPoint type never fails a session.** Redis store reads skip it; inbox delivery
+  surfaces it as poison so it is quarantined rather than left pending (a pending entry holds the
+  completion tail's inbox re-check open forever).
 
 ## `orcastork_lite/` — the scheduling-only sibling
 

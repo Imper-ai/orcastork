@@ -1,7 +1,9 @@
 """The ``DataPoint`` model — the framework's unit of data.
 
 A ``DataPoint`` is a frozen pydantic model whose **identity is ``(type, value)``**,
-excluding timestamps, so re-observing a value dedups (keyed-merge). Concrete leaves pin
+excluding timestamps, so re-observing a value dedups (keyed-merge). The identity is computed
+once, at construction, so a value that
+cannot be made hashable is refused there (:class:`UnhashableValueError`). Concrete leaves pin
 a ``type`` ``Literal`` discriminator and carry a class-level :class:`DataPointTypeConfig`
 (``pii`` / ``ephemeral``); abstract intermediates group leaves for subtype substitution
 but are not union members.
@@ -19,10 +21,10 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, ClassVar, Self
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, PrivateAttr
 from pydantic_core import PydanticUndefined
 
-from ..exceptions import DuplicateRegistrationError, InvalidDataPointError
+from ..exceptions import DuplicateRegistrationError, InvalidDataPointError, UnhashableValueError
 from ..ids import DataPointType, OperatorRef
 
 # Registry of concrete leaves keyed by discriminator value, the set of abstract
@@ -53,13 +55,25 @@ class DataPointTypeConfig:
 
 
 def _make_hashable(obj: Any) -> Any:
-    """Recursively coerce a value into a hashable form (lists/dicts/sets → tuples)."""
+    """Recursively coerce a value into a hashable, order-insensitive form (lists/dicts/sets → tuples).
+
+    A pydantic model is reduced through its dump, so two models with equal fields share an identity.
+    Anything else must already be hashable: a value that is not raises :class:`UnhashableValueError`
+    where the DataPoint is built, instead of a ``TypeError`` from deep inside the session state.
+    """
     if isinstance(obj, (list, tuple)):
         return tuple(_make_hashable(item) for item in obj)
+    # Sorted by repr: a set may mix types that cannot be compared with each other.
     if isinstance(obj, dict):
-        return tuple(sorted((key, _make_hashable(value)) for key, value in obj.items()))
+        return tuple(sorted(((key, _make_hashable(value)) for key, value in obj.items()), key=repr))
     if isinstance(obj, (set, frozenset)):
-        return tuple(sorted(_make_hashable(item) for item in obj))
+        return tuple(sorted((_make_hashable(item) for item in obj), key=repr))
+    if isinstance(obj, BaseModel):
+        return _make_hashable(obj.model_dump())
+    try:
+        hash(obj)
+    except TypeError as error:
+        raise UnhashableValueError(f'{type(obj).__name__} value cannot be part of a DataPoint identity') from error
     return obj
 
 
@@ -83,7 +97,7 @@ def identity_key(data_point: 'BaseDataPoint[Any]') -> tuple[DataPointType, Any]:
     :func:`canonical_value` of the value. Both build on the one ``_make_hashable`` normalization, so
     dedup decisions never diverge across adapters.
     """
-    return (data_point.type, _make_hashable(data_point.value))
+    return data_point.identity
 
 
 def registry_version() -> int:
@@ -118,6 +132,11 @@ class BaseDataPoint[ValueT](BaseModel):
     config: ClassVar[DataPointTypeConfig]  # set on an intermediate (inherited) or per leaf
     __abstract__: ClassVar[bool] = True  # the base itself is abstract; leaves are concrete
 
+    # Computed once at construction: the model is frozen, so it cannot change, and every keyed-merge,
+    # hash and equality check reads it back instead of re-normalizing the value. ``model_copy`` (a
+    # re-observation) carries it over.
+    _identity: tuple[DataPointType, Any] = PrivateAttr()
+
     @classmethod
     def __pydantic_init_subclass__(cls, **kwargs: Any) -> None:
         super().__pydantic_init_subclass__(**kwargs)
@@ -151,13 +170,21 @@ class BaseDataPoint[ValueT](BaseModel):
         _REGISTRY[discriminator] = cls
         _registry_version += 1
 
+    def model_post_init(self, _context: Any, /) -> None:
+        self._identity = (self.type, _make_hashable(self.value))
+
+    @property
+    def identity(self) -> tuple[DataPointType, Any]:
+        """The keyed-merge identity — ``(type, normalized-value)``, timestamps excluded."""
+        return self._identity
+
     def __hash__(self) -> int:
-        return hash((self.type, _make_hashable(self.value)))
+        return hash(self._identity)
 
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, BaseDataPoint):
             return NotImplemented
-        return (self.type, _make_hashable(self.value)) == (other.type, _make_hashable(other.value))
+        return self._identity == other._identity
 
     @property
     def is_pii(self) -> bool:

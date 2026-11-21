@@ -94,12 +94,13 @@ from .mirror import MirrorWriteResult, SessionStateMirror
 
 DEFAULT_OPERATION_TIMEOUT = 30.0
 DEFAULT_SESSION_DEADLINE = 300.0
-# How often the orchestrator renews its ownership lease while working. Must be shorter than the
-# lock adapter's TTL — and the TTL should exceed the longest single operator run the loop can be
-# blocked on without renewing: the global `operation_timeout`, raised by any larger per-operator
-# `OperatorPolicy.timeout` override. A renew that finds a higher epoch raises and is turned into
-# a clean SUPERSEDED stop.
+# How often the orchestrator renews its ownership lease while gathering — between passes, while it
+# waits on the inbox, and while operators run. Must be shorter than the lock adapter's TTL. A renew
+# that finds a higher epoch raises and is turned into a clean SUPERSEDED stop.
 DEFAULT_LEASE_RENEW_INTERVAL = 10.0
+# The bound on one audit write. The audit is a record of the session, not part of it, so a write that
+# fails or outlives this is logged and dropped rather than stalling the run.
+DEFAULT_AUDIT_TIMEOUT = 5.0
 # How many deliveries a valid-but-unappliable inbox entry gets before it is quarantined instead
 # of redelivered: enough for a transient store fault to clear, small enough that a persistently
 # bad entry cannot grind against the store for the session's whole lifetime.
@@ -114,6 +115,8 @@ class SessionStatus(Enum):
     COMPLETED = 'completed'
     SUPERSEDED = 'superseded'  # a higher epoch took over mid-run; this orchestrator stopped without finalizing
     PARKED = 'parked'  # idle past park_after while waiting on the inbox; not finalized — a deliver/resume re-drives it
+    # Owned by a live orchestrator elsewhere: the call that returned this did not run the session.
+    RUNNING = 'running'
 
 
 @dataclass(frozen=True)
@@ -143,6 +146,19 @@ class _Completed:
     operator_id: OperatorId
     error: Exception | None  # set if the operator raised/timed out; its prior emissions are already persisted
     run_seconds: float = 0.0  # the operator's own run time (invoked -> completed), for the audit/profile
+    # The run's timeout was clipped to the session budget and it hit that clipped bound: the deadline
+    # passed while it ran, which is a cancellation at the deadline, not an operator timeout.
+    cut_by_deadline: bool = False
+
+
+@dataclass(frozen=True)
+class _ArmedRetry:
+    """What a relaunch owes the failure it retries: the error to report if it can never run, and the
+    revision the failed run observed, which the retry deliberately left un-advanced as its watermark."""
+
+    error: Exception
+    observed_revision: Revision
+    attempt: int
 
 
 @dataclass
@@ -194,6 +210,7 @@ class Orchestrator:
         retry_policy: RetryPolicy | None = None,
         flow_identity: FlowIdentity | None = None,
         fresh_deadline: bool = False,
+        audit_timeout: float = DEFAULT_AUDIT_TIMEOUT,
     ) -> None:
         self._session_id = session_id
         self._namespace_id = namespace_id
@@ -215,6 +232,7 @@ class Orchestrator:
         self._session_deadline = DEFAULT_SESSION_DEADLINE if session_deadline is None else session_deadline
         self._park_after = park_after
         self._lease_renew_interval = lease_renew_interval
+        self._audit_timeout = audit_timeout
         self._max_inbox_deliveries = (
             DEFAULT_MAX_INBOX_DELIVERIES if max_inbox_deliveries is None else max_inbox_deliveries
         )
@@ -243,6 +261,8 @@ class Orchestrator:
         self._registered_caps = {capability.capability_id: capability for capability in self._capabilities}
         self._runs: dict[OperatorId, int] = {}
         self._failed_attempts: dict[OperatorId, int] = {}  # consecutive failures of the current retry sequence
+        self._armed_retries: dict[OperatorId, _ArmedRetry] = {}  # the failure each armed retry window stands for
+        self._deadline_hit = False  # a clipped run reported the session deadline passing under it
         self._prev_caps: dict[OperatorId, frozenset[CapabilityId]] = {}
         self._watermarks: dict[OperatorId, Revision | None] = {}  # rehydrated once per gather (sole writer)
         self._activated_seen: set[CapabilityId] = set()
@@ -323,15 +343,17 @@ class Orchestrator:
             # A terminal activation failure means a whole dependent subgraph silently disappeared for
             # the session — that must be visible in the audit trail, mirroring _audit_capability.
             async def audit_terminal_activation_failure(capability_id: CapabilityId, error: Exception) -> None:
-                await self._runtime.audit.append(
-                    AuditLogEntry(
-                        session_id=self._session_id,
-                        namespace_id=self._namespace_id,
-                        epoch=epoch,
-                        timestamp=self._runtime.clock.now(),
-                        kind=AuditKind.CAPABILITY_ACTIVATION_FAILED,
-                        capability=CapabilityAuditInfo(capability_id=capability_id, error=str(error)),
-                    )
+                await self._append_audit_entries(
+                    [
+                        AuditLogEntry(
+                            session_id=self._session_id,
+                            namespace_id=self._namespace_id,
+                            epoch=epoch,
+                            timestamp=self._runtime.clock.now(),
+                            kind=AuditKind.CAPABILITY_ACTIVATION_FAILED,
+                            capability=CapabilityAuditInfo(capability_id=capability_id, error=str(error)),
+                        )
+                    ]
                 )
 
             activator = CapabilityActivator(
@@ -369,6 +391,15 @@ class Orchestrator:
                     parked = await self._gather(epoch, activator, breaker)
                 self._runtime.telemetry.session_gather_seconds.record(self._runtime.clock.monotonic() - gather_started)
                 if parked:
+                    if await self._runtime.inbox.pending_count(self._session_id) > 0:
+                        # A delivery landed between the park decision and here. Its deliverer saw the
+                        # lease held and left it to this owner, so releasing now would strand it until
+                        # that pod's in-memory recheck — or for good, if that pod dies. Gather it instead.
+                        logger.debug(
+                            'Inbox entry arrived as the session parked; gathering it instead of parking',
+                            session_id=self._session_id,
+                        )
+                        continue
                     # Parked: no aggregation and no completion mark, so the session stays resumable —
                     # a supervisor sees a not-complete, unlocked session and re-drives it on delivery.
                     # The audit entries are appended here so the trail shows the park.
@@ -566,17 +597,19 @@ class Orchestrator:
                 stored_fingerprint=stored,
                 current_fingerprint=current,
             )
-            await self._runtime.audit.append(
-                AuditLogEntry(
-                    session_id=self._session_id,
-                    namespace_id=self._namespace_id,
-                    epoch=epoch,
-                    timestamp=self._runtime.clock.now(),
-                    kind=AuditKind.FLOW_DRIFT_DETECTED,
-                    flow=FlowAuditInfo(
-                        flow_name=self._flow_identity.name, stored_fingerprint=stored, current_fingerprint=current
-                    ),
-                )
+            await self._append_audit_entries(
+                [
+                    AuditLogEntry(
+                        session_id=self._session_id,
+                        namespace_id=self._namespace_id,
+                        epoch=epoch,
+                        timestamp=self._runtime.clock.now(),
+                        kind=AuditKind.FLOW_DRIFT_DETECTED,
+                        flow=FlowAuditInfo(
+                            flow_name=self._flow_identity.name, stored_fingerprint=stored, current_fingerprint=current
+                        ),
+                    )
+                ]
             )
         await self._runtime.store.set_flow_fingerprint(self._session_id, current, epoch=epoch)
 
@@ -631,8 +664,9 @@ class Orchestrator:
         # once and every later delta read stays local.
         for watermark in sorted({mark for mark in self._watermarks.values() if mark is not None}):
             await self._mirror.prime_change_baseline(watermark)
+        self._deadline_hit = False
         try:
-            while self._runtime.clock.monotonic() < deadline:
+            while not self._deadline_hit and self._runtime.clock.monotonic() < deadline:
                 last_renew = await self._renew_lease_if_due(epoch, last_renew)
                 await self._drain_inbox(epoch)
                 view = await self._mirror.snapshot(self._session_id)
@@ -650,8 +684,11 @@ class Orchestrator:
                     debounce,
                     retries,
                     running,
+                    epoch,
                     completion_satisfied=completion_satisfied,
                 )
+                now = self._runtime.clock.monotonic()
+                remaining = deadline - now
                 for runnable in plan.runnable:
                     logger.debug(
                         'Launching operator for the current gathering iteration',
@@ -664,30 +701,33 @@ class Orchestrator:
                     # saw, and by completion the live store/capability set will have moved on.
                     self._prev_caps[runnable.operator.operator_id] = capabilities.available_ids()
                     task = asyncio.create_task(
-                        self._run_one(runnable.operator, runnable.delta, epoch, view, capabilities, queue)
+                        self._run_one(runnable.operator, runnable.delta, epoch, view, capabilities, queue, remaining)
                     )
                     running[runnable.operator.operator_id] = _Running(task, observed)
                     if runnable.is_retry:
                         retries.clear(runnable.operator.operator_id)  # consume the armed retry
+                        self._armed_retries.pop(runnable.operator.operator_id, None)
                     elif runnable.is_rerun:
                         debounce.clear(runnable.operator.operator_id)  # consume the coalesced rerun
                         self._runtime.telemetry.operator_reruns_total.add(
                             1, {'operator_id': runnable.operator.operator_id}
                         )
                 if running:
-                    # Block on the first available signal — an emission to merge or an operator's
-                    # completion — then drain every signal already queued behind it, and re-plan once
-                    # for the whole batch. Nothing is delayed (each drained signal was produced before
-                    # the re-plan), so eagerness is intact; planning once on the superset launches
-                    # everything any individual signal would have, without a snapshot per emission.
-                    # No wall-clock timeout: operators always finish (a per-op timeout bounds them), and a
-                    # debounce window is only fast-forwarded (via the injected clock) once nothing runs.
-                    signals: list[_Emitted | _Completed] = [await queue.get()]
-                    while True:
-                        try:
-                            signals.append(queue.get_nowait())
-                        except asyncio.QueueEmpty:
-                            break
+                    # Wait for the first available signal — an emission to merge or an operator's
+                    # completion — or for the next lease renewal or armed window to come due, whichever
+                    # is first: an operator that stays quiet must neither let the lease lapse under a
+                    # live owner nor starve a due rerun or retry. Then drain every signal already queued
+                    # behind it and re-plan once for the whole batch: nothing is delayed, and planning
+                    # once on the superset launches everything any individual signal would have.
+                    window = None if plan.next_due_in is None else min(plan.next_due_in, deadline - now)
+                    first = await self._next_signal(queue, window=window, renew_in=self._renew_due_in(last_renew))
+                    if first is None:
+                        # A window or the renewal came due. Renewing here is what keeps an operator that
+                        # runs past the lock TTL on its pod; a fenced renew stops the run as SUPERSEDED.
+                        await self._runtime.lock.renew(self._session_id, epoch=epoch)
+                        last_renew = self._runtime.clock.monotonic()
+                        continue
+                    signals = [first, *self._drain_signals(queue)]
                     await self._consume_batch(signals, epoch, breaker, retries, running)
                     continue
                 if plan.next_due_in is not None:
@@ -708,7 +748,8 @@ class Orchestrator:
                     return True
             else:
                 # Falling out of the loop condition (never via break/park) is exactly a deadline hit —
-                # including a resume whose persisted budget was already spent and never entered the loop.
+                # including a resume whose persisted budget was already spent and never entered the loop,
+                # and a run whose timeout was clipped to the budget reporting it ran out.
                 self._runtime.telemetry.session_deadline_hits_total.add(1)
                 logger.warning(
                     'Session deadline hit; gathering stopped and any in-flight operators will be cancelled',
@@ -716,8 +757,40 @@ class Orchestrator:
                     in_flight_operator_ids=sorted(running),
                 )
         finally:
-            await self._drain_remaining(queue, running, epoch)
+            await self._drain_remaining(queue, running, epoch, breaker, retries)
         return False
+
+    def _renew_due_in(self, last_renew: float) -> float:
+        return max(self._lease_renew_interval - (self._runtime.clock.monotonic() - last_renew), 0.0)
+
+    async def _next_signal(
+        self, queue: asyncio.Queue[_Emitted | _Completed], *, window: float | None, renew_in: float
+    ) -> _Emitted | _Completed | None:
+        """The next queued signal, or ``None`` when an armed window or the lease renewal comes due first.
+
+        The window is a timer on the injected clock, the fast-forward the idle branch performs. The
+        renewal is a timeout, like an operator's own: it bounds how long the loop blocks, so it runs on
+        the event loop's time, which is the time the lease's TTL runs on in production. Cancelling a
+        pending ``queue.get`` is safe: a signal that lands afterwards stays queued for the next pass.
+        """
+        get = asyncio.ensure_future(queue.get())
+        timer = None if window is None else asyncio.ensure_future(self._runtime.clock.sleep(max(window, 0.0)))
+        waiters = {get} if timer is None else {get, timer}
+        try:
+            await asyncio.wait(waiters, timeout=renew_in, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for pending in waiters:
+                if not pending.done():
+                    pending.cancel()
+            await asyncio.gather(*waiters, return_exceptions=True)
+        return get.result() if get.done() and not get.cancelled() else None
+
+    @staticmethod
+    def _drain_signals(queue: asyncio.Queue[_Emitted | _Completed]) -> list[_Emitted | _Completed]:
+        signals: list[_Emitted | _Completed] = []
+        while not queue.empty():
+            signals.append(queue.get_nowait())
+        return signals
 
     def _warn_if_stalled(self, plan: _GatherPlan) -> None:
         # Defensive invariant guard: with nothing running and nothing due, no pending operator should
@@ -838,6 +911,16 @@ class Orchestrator:
         running: dict[OperatorId, _Running],
     ) -> None:
         record = running.pop(signal.operator_id)
+        if signal.cut_by_deadline:
+            # Not a run that finished, and not this operator's fault: the session's budget ran out under it.
+            # Treated exactly like a run cancelled at the deadline, and the loop exits on the flag.
+            self._deadline_hit = True
+            logger.warning(
+                'Operator run cancelled at the session deadline',
+                session_id=self._session_id,
+                operator_id=signal.operator_id,
+            )
+            return
         self._runs[signal.operator_id] = self._runs.get(signal.operator_id, 0) + 1
         # Every attempt counts toward the breaker: it bounds cycle iterations, and a retried run on a
         # cycle still consumes that budget — otherwise a failing cycle operator could loop between the
@@ -870,6 +953,8 @@ class Orchestrator:
             run_seconds=signal.run_seconds,
             error=signal.error,
         )
+        if retrying and signal.error is not None:
+            self._armed_retries[signal.operator_id] = _ArmedRetry(signal.error, record.observed_revision, attempt)
         if retrying:
             # A retried failure keeps its old watermark: the failed attempt never durably processed its
             # delta, so the relaunch must re-present the same changes. Its emissions are already merged —
@@ -916,27 +1001,26 @@ class Orchestrator:
             )
 
     async def _drain_remaining(
-        self, queue: asyncio.Queue[_Emitted | _Completed], running: dict[OperatorId, _Running], epoch: Epoch
+        self,
+        queue: asyncio.Queue[_Emitted | _Completed],
+        running: dict[OperatorId, _Running],
+        epoch: Epoch,
+        breaker: CircuitBreaker,
+        retries: DebounceController,
     ) -> None:
         # Normal quiescent exit reaches here with both already empty (a no-op). The other exit is the
-        # session deadline with operators still in flight: persist whatever was already emitted, then
-        # cancel the stragglers — the deadline is the one signal allowed to stop a running operator.
-        await self._drain_queue(queue, epoch)
+        # session deadline with operators still in flight. Anything already queued is applied first,
+        # completions included: an operator that finished during the last pass's awaits is a finished
+        # run, recorded as such, not swept up as cancelled. Only what is genuinely still running is then
+        # cancelled — the deadline is the one signal allowed to stop a running operator.
+        await self._consume_batch(self._drain_signals(queue), epoch, breaker, retries, running)
         for record in running.values():
             record.task.cancel()
         if running:
             await asyncio.gather(*(record.task for record in running.values()), return_exceptions=True)
-        # Drain once more: a task can enqueue a final emission right as it is cancelled, and that signal
-        # (already past the epoch-guarded merge boundary) would otherwise be dropped.
-        await self._drain_queue(queue, epoch)
-
-    async def _drain_queue(self, queue: asyncio.Queue[_Emitted | _Completed], epoch: Epoch) -> None:
-        emitted: list[_Emitted] = []
-        while not queue.empty():
-            signal = queue.get_nowait()
-            if isinstance(signal, _Emitted):
-                emitted.append(signal)
-        await self._merge_emissions(emitted, epoch)
+        # Drain once more: a task can enqueue a final signal right as it is cancelled, and it would
+        # otherwise be dropped.
+        await self._consume_batch(self._drain_signals(queue), epoch, breaker, retries, running)
 
     async def _plan(
         self,
@@ -946,6 +1030,7 @@ class Orchestrator:
         debounce: DebounceController,
         retries: DebounceController,
         running: dict[OperatorId, _Running],
+        epoch: Epoch,
         *,
         completion_satisfied: bool,
     ) -> _GatherPlan:
@@ -966,12 +1051,17 @@ class Orchestrator:
             ran = operator.operator_id in self._runs or self._watermarks.get(operator.operator_id) is not None
             if not ran:
                 not_yet_run.append(operator)
-            if not is_ready(operator, present_types=present_types, available_capability_types=available_types):
-                continue
+            ready = is_ready(operator, present_types=present_types, available_capability_types=available_types)
             if retries.is_scheduled(operator.operator_id):
                 # An armed retry owns this operator's next launch: it relaunches even with no new data
                 # and even when the policy never reruns on data (its watermark is deliberately stale),
                 # and quiescence must wait for it to come due rather than break to aggregation.
+                if not ready:
+                    # Readiness is lost only to a capability that went away, so the relaunch can never
+                    # run: the failure it stood for is terminal now, not forgotten with the window.
+                    retries.clear(operator.operator_id)
+                    await self._record_terminal_retry(operator.operator_id, epoch)
+                    continue
                 if retries.is_due(operator.operator_id):
                     delta = await self._delta_for(operator, capabilities)
                     runnable.append(_Runnable(operator, delta, is_rerun=False, is_retry=True))
@@ -979,6 +1069,8 @@ class Orchestrator:
                     retry_due_at = retries.due_at(operator.operator_id)
                     if retry_due_at is not None:
                         soonest_due = retry_due_at if soonest_due is None else min(soonest_due, retry_due_at)
+                continue
+            if not ready:
                 continue
             if not ran:
                 delta = await self._delta_for(operator, capabilities)
@@ -1008,6 +1100,18 @@ class Orchestrator:
                     soonest_due = due_at if soonest_due is None else min(soonest_due, due_at)
         next_due_in = None if soonest_due is None else max(0.0, soonest_due - self._runtime.clock.monotonic())
         return _GatherPlan(runnable, not_yet_run, next_due_in, present_types, available_types)
+
+    async def _record_terminal_retry(self, operator_id: OperatorId, epoch: Epoch) -> None:
+        armed = self._armed_retries.pop(operator_id)
+        self._failed_attempts.pop(operator_id, None)  # a later data-driven rerun starts a fresh sequence
+        logger.opt(exception=armed.error).warning(
+            'Operator retry abandoned: the operator lost readiness while its retry was armed',
+            session_id=self._session_id,
+            operator_id=operator_id,
+            attempt=armed.attempt,
+        )
+        # Advance to what the failed run observed, as any terminal failure does: what merged since is new data.
+        await self._advance_watermark(operator_id, armed.observed_revision, epoch)
 
     async def _delta_for(self, operator: type[Operator], capabilities: CapabilityView) -> InvocationDelta:
         return await operator_delta(
@@ -1044,6 +1148,7 @@ class Orchestrator:
         view: DataPointView,
         capabilities: CapabilityView,
         queue: asyncio.Queue[_Emitted | _Completed],
+        remaining: float,
     ) -> None:
         """Run one operator in its fault boundary, queueing each emission and then its completion."""
         aggregation = (
@@ -1070,6 +1175,10 @@ class Orchestrator:
         )
         error: Exception | None = None
         started = self._runtime.clock.monotonic()
+        # A run never outlives the session: its timeout is clipped to the budget left, so the deadline is
+        # hard even while the loop is blocked waiting on this run's signals.
+        timeout = min(self._timeout_for(operator), max(remaining, 0.0))
+        clipped = timeout < self._timeout_for(operator)
 
         async def drain(instance: Operator) -> None:
             # Stamp provenance + observation time here, inside the fault-isolation boundary: operators
@@ -1090,7 +1199,7 @@ class Orchestrator:
                 # validation) must be recorded as a FAILED run — not drop the task before it enqueues
                 # _Completed, which would leave it wedged in `running` with no log/audit/breaker.
                 instance = operator()
-                await asyncio.wait_for(drain(instance), timeout=self._timeout_for(operator))
+                await asyncio.wait_for(drain(instance), timeout=timeout)
             except Exception as exc:  # operator fault-isolation boundary — never wedge the session
                 error = exc
             outcome = OperatorOutcome.FAILED if error is not None else OperatorOutcome.SUCCEEDED
@@ -1102,7 +1211,8 @@ class Orchestrator:
                 span.set_status(StatusCode.ERROR, str(error))
         run_seconds = self._runtime.clock.monotonic() - started
         self._observe_run_seconds(operator.operator_id, run_seconds, outcome)
-        await queue.put(_Completed(operator.operator_id, error, run_seconds))
+        cut_by_deadline = clipped and isinstance(error, TimeoutError)
+        await queue.put(_Completed(operator.operator_id, error, run_seconds, cut_by_deadline))
 
     def _timeout_for(self, operator: type[Operator]) -> float:
         # A wrapped streaming collector legitimately runs far longer than a quick scoring operator,
@@ -1419,15 +1529,17 @@ class Orchestrator:
             reason=reason,
             delivery_count=delivery_count,
         )
-        await self._runtime.audit.append(
-            AuditLogEntry(
-                session_id=self._session_id,
-                namespace_id=self._namespace_id,
-                epoch=epoch,
-                timestamp=self._runtime.clock.now(),
-                kind=AuditKind.INBOX_ENTRY_QUARANTINED,
-                inbox=InboxAuditInfo(entry_id=entry_id, reason=reason, delivery_count=delivery_count),
-            )
+        await self._append_audit_entries(
+            [
+                AuditLogEntry(
+                    session_id=self._session_id,
+                    namespace_id=self._namespace_id,
+                    epoch=epoch,
+                    timestamp=self._runtime.clock.now(),
+                    kind=AuditKind.INBOX_ENTRY_QUARANTINED,
+                    inbox=InboxAuditInfo(entry_id=entry_id, reason=reason, delivery_count=delivery_count),
+                )
+            ]
         )
 
     async def _merge(
@@ -1480,20 +1592,39 @@ class Orchestrator:
                         epoch=epoch,
                     )
                 )
-        await self._append_audit_entries(audit_entries)
         # One count per DataPoint presented at the sole-mutator merge point, emitted only AFTER the audit
-        # append succeeded — the count rides the audit seam, so a failed append leaves neither the row nor
+        # append succeeded — the count rides the audit seam, so a dropped append leaves neither the row nor
         # the count behind and the metric can never disagree with the replayed trail.
-        for kind in merge_kinds:
-            self._runtime.telemetry.data_points_merged_total.add(1, {'kind': kind})
+        if await self._append_audit_entries(audit_entries):
+            for kind in merge_kinds:
+                self._runtime.telemetry.data_points_merged_total.add(1, {'kind': kind})
         await self._archive_entries(archive_entries)
 
-    async def _append_audit_entries(self, entries: Sequence[AuditLogEntry]) -> None:
+    async def _append_audit_entries(self, entries: Sequence[AuditLogEntry]) -> bool:
+        """Append to the audit, bounded; ``False`` when the write failed and the entries were dropped.
+
+        The audit records the session, it does not drive it: a sink that raises or hangs (a slow or
+        unreachable database) is logged and dropped, never allowed to stall or crash the run. Fencing
+        is the one exception — a stale epoch means a successor owns the session, so it still stops this run.
+        """
+        if not entries:
+            return True
         # The batch variant only when more than one entry is in hand; single-event paths keep append.
-        if len(entries) == 1:
-            await self._runtime.audit.append(entries[0])
-        elif entries:
-            await self._runtime.audit.append_many(entries)
+        audit = self._runtime.audit
+        write = audit.append(entries[0]) if len(entries) == 1 else audit.append_many(entries)
+        try:
+            await asyncio.wait_for(write, timeout=self._audit_timeout)
+        except StaleEpochError:
+            raise
+        except Exception:  # audit fault-isolation boundary
+            logger.opt(exception=True).warning(
+                'Audit write failed or timed out; its entries were dropped',
+                session_id=self._session_id,
+                entry_count=len(entries),
+                audit_timeout=self._audit_timeout,
+            )
+            return False
+        return True
 
     async def _archive_entries(self, entries: Sequence[ArchivedDataPoint]) -> None:
         if len(entries) == 1:
@@ -1555,8 +1686,9 @@ class Orchestrator:
                 f'{description} did not finish within {self._operation_timeout}s'
             ) from error
         # Logged on SUCCESS too: without it the only signal a tail step produces is its timeout, so how
-        # close a healthy session runs to the budget is invisible until it crosses it.
-        logger.info(
+        # close a healthy session runs to the budget is invisible until it crosses it. DEBUG, since it
+        # fires several times per completion.
+        logger.debug(
             'Completion-tail step finished inside its budget; compare elapsed_seconds against '
             'budget_seconds to see how much headroom the session had',
             session_id=self._session_id,
@@ -1630,14 +1762,16 @@ class Orchestrator:
         )
 
     async def _audit_session_parked(self, epoch: Epoch) -> None:
-        await self._runtime.audit.append(
-            AuditLogEntry(
-                session_id=self._session_id,
-                namespace_id=self._namespace_id,
-                epoch=epoch,
-                timestamp=self._runtime.clock.now(),
-                kind=AuditKind.SESSION_PARKED,
-            )
+        await self._append_audit_entries(
+            [
+                AuditLogEntry(
+                    session_id=self._session_id,
+                    namespace_id=self._namespace_id,
+                    epoch=epoch,
+                    timestamp=self._runtime.clock.now(),
+                    kind=AuditKind.SESSION_PARKED,
+                )
+            ]
         )
 
     async def _audit_capability(self, capability_id: CapabilityId, epoch: Epoch) -> None:
@@ -1646,15 +1780,17 @@ class Orchestrator:
             session_id=self._session_id,
             capability_id=capability_id,
         )
-        await self._runtime.audit.append(
-            AuditLogEntry(
-                session_id=self._session_id,
-                namespace_id=self._namespace_id,
-                epoch=epoch,
-                timestamp=self._runtime.clock.now(),
-                kind=AuditKind.CAPABILITY_ACTIVATED,
-                capability=CapabilityAuditInfo(capability_id=capability_id),
-            )
+        await self._append_audit_entries(
+            [
+                AuditLogEntry(
+                    session_id=self._session_id,
+                    namespace_id=self._namespace_id,
+                    epoch=epoch,
+                    timestamp=self._runtime.clock.now(),
+                    kind=AuditKind.CAPABILITY_ACTIVATED,
+                    capability=CapabilityAuditInfo(capability_id=capability_id),
+                )
+            ]
         )
 
     def _count_session(self, status: SessionStatus, span: Span) -> None:
@@ -1683,22 +1819,24 @@ class Orchestrator:
         # many run dispositions (including SKIPPED and the terminal DEAD_LETTERED record) the
         # session produced.
         self._runtime.telemetry.operator_runs_total.add(1, {'operator_id': operator_id, 'outcome': outcome.value})
-        await self._runtime.audit.append(
-            AuditLogEntry(
-                session_id=self._session_id,
-                namespace_id=self._namespace_id,
-                epoch=epoch,
-                timestamp=self._runtime.clock.now(),
-                operator_id=operator_id,
-                kind=AuditKind.OPERATOR_INVOKED,
-                operator=OperatorAuditInfo(
-                    outcome=outcome,
-                    run_count=run_count,
-                    attempt=attempt,
-                    run_seconds=run_seconds,
-                    error=None if error is None else str(error),
-                ),
-            )
+        await self._append_audit_entries(
+            [
+                AuditLogEntry(
+                    session_id=self._session_id,
+                    namespace_id=self._namespace_id,
+                    epoch=epoch,
+                    timestamp=self._runtime.clock.now(),
+                    operator_id=operator_id,
+                    kind=AuditKind.OPERATOR_INVOKED,
+                    operator=OperatorAuditInfo(
+                        outcome=outcome,
+                        run_count=run_count,
+                        attempt=attempt,
+                        run_seconds=run_seconds,
+                        error=None if error is None else str(error),
+                    ),
+                )
+            ]
         )
 
     async def _audit_capability_invocation(
@@ -1716,13 +1854,15 @@ class Orchestrator:
             parameter_keys=sorted(parameters),
         )
         redacted = {key: '<redacted>' for key in parameters}
-        await self._runtime.audit.append(
-            AuditLogEntry(
-                session_id=self._session_id,
-                namespace_id=self._namespace_id,
-                epoch=epoch,
-                timestamp=self._runtime.clock.now(),
-                kind=AuditKind.CAPABILITY_INVOKED,
-                capability=CapabilityAuditInfo(capability_id=capability_id, action=action, parameters=redacted),
-            )
+        await self._append_audit_entries(
+            [
+                AuditLogEntry(
+                    session_id=self._session_id,
+                    namespace_id=self._namespace_id,
+                    epoch=epoch,
+                    timestamp=self._runtime.clock.now(),
+                    kind=AuditKind.CAPABILITY_INVOKED,
+                    capability=CapabilityAuditInfo(capability_id=capability_id, action=action, parameters=redacted),
+                )
+            ]
         )

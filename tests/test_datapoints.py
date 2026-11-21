@@ -380,6 +380,8 @@ def _sample_value_for(leaf: type[BaseDataPoint[Any]]) -> Any:
         return ['x', 'y']
     if annotation == dict[str, list[str]]:
         return {'tags': ['x']}
+    if annotation is Any:
+        return 'probe'
     raise AssertionError(f'no sample value defined for leaf value type {annotation!r}')
 
 
