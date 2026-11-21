@@ -106,6 +106,7 @@ class EffectGuard:
             )
 
     async def _claim(self, namespaced: str, on_unknown: EffectRecovery) -> bool:
+        """Whether this attempt owns the effect and must run it."""
         claim = await self._store.claim_effect(self._session_id, namespaced, epoch=self._epoch, reclaim_stale=False)
         match claim:
             case EffectClaim.ACQUIRED:
@@ -116,6 +117,7 @@ class EffectGuard:
                 return await self._recover(namespaced, on_unknown)
 
     async def _recover(self, namespaced: str, on_unknown: EffectRecovery) -> bool:
+        """Whether to rerun an effect a predecessor left pending with an unknown outcome, per ``on_unknown``."""
         match on_unknown:
             case EffectRecovery.SKIP:
                 # The stale mark is deliberately left in place: a later resume must see the same

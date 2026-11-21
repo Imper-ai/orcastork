@@ -132,6 +132,7 @@ def check_graph(
 
 
 def _report(label: str, result: GraphCheck) -> int:
+    """Print one graph check's findings; returns the exit code, 1 when the check failed."""
     for finding in result.findings:
         print(f'{label}: {finding}')
     if result.error is not None:
@@ -176,6 +177,7 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    """The ``orcastork-graph`` console script; returns the process exit code."""
     args = _parse_args(argv)
     if not args.check and args.mermaid is None and args.permitted is None:
         print('nothing to do: pass --check, --mermaid and/or --permitted', file=sys.stderr)

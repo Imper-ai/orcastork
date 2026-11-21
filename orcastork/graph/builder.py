@@ -29,6 +29,7 @@ Node = type[Operator] | type[Capability]
 
 
 def effective_produces(operator: type[Operator]) -> set[type[BaseDataPoint[Any]]]:
+    """The concrete DataPoint types an operator can emit, each abstract declaration expanded to its leaves."""
     produced: set[type[BaseDataPoint[Any]]] = set()
     for declared in operator.produces:
         if declared in _ABSTRACT_TYPES:

@@ -21,6 +21,7 @@ class CircuitBreaker:
         self._counts[operator_id] = self._counts.get(operator_id, 0) + 1
 
     def is_tripped(self, operator_id: OperatorId) -> bool:
+        """Whether the operator has used up its ``max_cycles`` cap; one with no cap never trips."""
         cap = self._caps.get(operator_id)
         return cap is not None and self._counts.get(operator_id, 0) >= cap
 
