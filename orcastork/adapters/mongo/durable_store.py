@@ -151,6 +151,7 @@ class MongoDurableStore:
         # which fences per (table, key)). The guard lives in a dedicated companion collection
         # (<table>-fencing) so it never pollutes the data collection. _id = key (no namespacing
         # needed in a dedicated collection). updated_at enables TTL reaping after sessions are dead.
+        """Fence ``(table, key)`` at ``epoch``; raises ``StaleEpochError`` if a higher epoch already wrote it."""
         current = int(epoch)
         fencing_name = f'{table}-fencing'
         await self._ensure_fencing_ttl(fencing_name)
@@ -181,6 +182,7 @@ class MongoDurableStore:
         # to insert a contribution marker that a higher epoch would then read as already done. The guard
         # lives in contributions-fencing (_id = session_id) separate from the real markers in contributions
         # (_id = session\x00operator), so the data collection stays clean. updated_at enables TTL reaping.
+        """Fence the session's contribution markers at ``epoch``; raises ``StaleEpochError`` if a higher one wrote."""
         current = int(epoch)
         await self._ensure_fencing_ttl('contributions-fencing')
         contributions_fencing = self._database['contributions-fencing']

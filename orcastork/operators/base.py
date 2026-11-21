@@ -83,6 +83,7 @@ class Operator(ABC):
 
     @classmethod
     def registered(cls) -> dict[OperatorId, type['Operator']]:
+        """A copy of the operator registry, keyed by ``operator_id``."""
         return dict(Operator._registry)
 
     @abstractmethod
