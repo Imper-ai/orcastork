@@ -19,12 +19,12 @@ warning on every read rather than failing the whole session; no write ever touch
 from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
 import orjson
 from loguru import logger
-from pydantic import BaseModel, ConfigDict
 from redis.asyncio import Redis
 
 from ...datapoints import BaseDataPoint, DataPointView, identity_string, parse_data_point
@@ -124,11 +124,9 @@ return 0
 """
 
 
-class _StoredEntry(BaseModel):
-    model_config = ConfigDict(frozen=True)
-
-    # Bare, not BaseDataPoint[Any]: a parametrized field would revalidate the DataPoint and lose its leaf class.
-    data_point: BaseDataPoint
+@dataclass(frozen=True)
+class _StoredEntry:
+    data_point: BaseDataPoint[Any]
     added: int
     updated: int
 
@@ -244,13 +242,7 @@ class RedisDataPointStore:
         for identity, raw in dps.items():
             data_point = self._parse(session_id, raw)
             if data_point is not None:
-                entries.append(
-                    _StoredEntry(
-                        data_point=data_point,
-                        added=int(added.get(identity, 0)),
-                        updated=int(updated.get(identity, 0)),
-                    )
-                )
+                entries.append(_StoredEntry(data_point, int(added.get(identity, 0)), int(updated.get(identity, 0))))
         return entries
 
     async def snapshot(self, session_id: SessionId) -> DataPointView:
