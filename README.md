@@ -308,9 +308,9 @@ result = await manager.start_session(
 > semantics (drift is fingerprint-detected and audited). You can also construct an
 > `Orchestrator` directly (see the tests) — the manager just adds epoch minting, the
 > scheduling gate, and orphan-resume on top. For production wiring, swap
-> `build_in_memory_runtime` for `orcastork.adapters.redis.build_redis_runtime(redis, key_prefix=...,
-> state_ttl_ms=...)` (store, inbox and lock in Redis; pass Mongo-backed ports for the rest if you
-> keep them); the operators/capabilities/aggregators are identical across backends.
+> `build_in_memory_runtime` for `orcastork.adapters.redis.build_redis_runtime(redis, state_ttl_ms=...)`
+> (store, inbox and lock in Redis; pass Mongo-backed ports for the rest if you keep them); the
+> operators/capabilities/aggregators are identical across backends.
 >
 > `start_session` never starts a second run of a session that exists: a completed one comes back
 > as it is (`COMPLETED`), a live one as `RUNNING`, and a parked or orphaned one is resumed.
@@ -1174,10 +1174,10 @@ families:
 - **redis** — `redis.asyncio` directly: Lua-CAS store (incl. `apply_resolved` and the effect
   keyspace), Streams inbox (consumer group + `XAUTOCLAIM`, poison-tolerant, durable
   quarantine, trimmed as it is applied), `SET NX PX` lease + monotonic `INCR` epoch, cooldown
-  gate, atomic Lua token-bucket rate limiter. Every adapter takes an optional `key_prefix`, and
-  `build_redis_runtime` wires the store, inbox and lock with one prefix and one state TTL (no-op
-  audit, archive and durable store unless you pass your own). A DataPoint of a type the process
-  does not know is skipped with a warning on every read, so a deploy that adds a type can roll back.
+  gate, atomic Lua token-bucket rate limiter. `build_redis_runtime` wires the store, inbox and
+  lock with one client and one state TTL (no-op audit, archive and durable store unless you pass
+  your own). A DataPoint of a type the process does not know is skipped with a warning on every
+  read, so a deploy that adds a type can roll back.
 - **mongo** — `pymongo` async directly: OCC version-guarded durable store, append-only audit sink
   (`append_many` allocates a contiguous sequence range under a **single meta CAS**, fencing
   the whole batch at once, then writes it straight to `orcastork-audit-log`), keyed-upsert

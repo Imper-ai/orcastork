@@ -17,7 +17,7 @@ validation error on a known type propagates. ``quarantine`` disposes of an entry
 The stream is trimmed as it is consumed: an acked or quarantined entry is deleted from it in the
 same atomic step, so the stream holds only what is still undelivered or in flight, and
 ``pending_count`` is its length. The stream key carries the sliding state TTL from the moment it
-exists. Every key and channel carries the optional ``key_prefix``.
+exists.
 """
 
 from __future__ import annotations
@@ -75,13 +75,13 @@ return acked
 
 
 class RedisStreamsInbox:
-    def __init__(self, redis: Redis, *, state_ttl_ms: int = DEFAULT_STATE_TTL_MS, key_prefix: str = '') -> None:
+    def __init__(self, redis: Redis, *, state_ttl_ms: int = DEFAULT_STATE_TTL_MS) -> None:
         self._redis: Any = redis  # see RedisDataPointStore: redis-py's sync/async union typing
         self._state_ttl_ms = state_ttl_ms
-        self._prefix = key_prefix
 
-    def _stream(self, session_id: SessionId) -> str:
-        return f'{self._prefix}inbox:{session_id}'
+    @staticmethod
+    def _stream(session_id: SessionId) -> str:
+        return f'inbox:{session_id}'
 
     async def _ensure_group(self, session_id: SessionId) -> None:
         try:
@@ -93,19 +93,23 @@ class RedisStreamsInbox:
         # Creating the group can create the stream itself; it must expire with the session from then on.
         await slide_ttl(self._redis, self._state_ttl_ms, self._stream(session_id))
 
-    def _wakeup_channel(self, session_id: SessionId) -> str:
-        return f'{self._prefix}inbox-wakeup:{session_id}'
+    @staticmethod
+    def _wakeup_channel(session_id: SessionId) -> str:
+        return f'inbox-wakeup:{session_id}'
 
-    def _quarantine_key(self, session_id: SessionId) -> str:
-        return f'{self._prefix}quarantine:{session_id}'
+    @staticmethod
+    def _quarantine_key(session_id: SessionId) -> str:
+        return f'quarantine:{session_id}'
 
-    def _epoch_key(self, session_id: SessionId) -> str:
-        return f'{self._prefix}inbox_epoch:{session_id}'
+    @staticmethod
+    def _epoch_key(session_id: SessionId) -> str:
+        return f'inbox_epoch:{session_id}'
 
-    def _acked_key(self, session_id: SessionId) -> str:
+    @staticmethod
+    def _acked_key(session_id: SessionId) -> str:
         # Written only by 0.1.1, which counted acks instead of deleting the acked entries; read so a
         # stream it left behind still reports the right pending count.
-        return f'{self._prefix}acked:{session_id}'
+        return f'acked:{session_id}'
 
     async def append(self, session_id: SessionId, data_point: BaseDataPoint[Any]) -> str:
         # The client decodes responses, so payloads flow as str — decode the orjson bytes here.

@@ -25,9 +25,7 @@ from orcastork.adapters.redis import (
     build_redis_runtime,
 )
 from orcastork.exceptions import StaleEpochError
-from orcastork.flow import FlowDefinition
 from orcastork.ids import Epoch, NamespaceId, OperatorId, Revision, SessionId
-from orcastork.manager import SessionOrchestrationManager
 from orcastork.orchestrator import Orchestrator, SessionStatus
 from orcastork.ports import CooldownGate, DataPointStore, Inbox, InboxEntry, SessionLock
 
@@ -427,26 +425,24 @@ async def test_rz_27_reclaim_keeps_distinct_counts_for_concurrently_pending_entr
     assert counts == {e1: 3, e2: 2}  # each entry mapped to its OWN times_delivered, never a shared count
 
 
-# --- 0.2.0: one runtime builder, a key prefix, a trimmed inbox, unknown types skipped ---------------------
-
-PREFIX = 'vw:'
+# --- 0.2.0: one runtime builder, a trimmed inbox, unknown types skipped ------------------------------
 
 
 class TestBuiltRedisStore(StoreConformance):
     @pytest.fixture
     def store(self, redis_client: FakeRedis) -> DataPointStore:
-        return build_redis_runtime(redis_client, key_prefix=PREFIX).store
+        return build_redis_runtime(redis_client).store
 
 
 class TestBuiltRedisInbox(InboxConformance):
     @pytest.fixture
     def inbox(self, redis_client: FakeRedis) -> Inbox:
-        return build_redis_runtime(redis_client, key_prefix=PREFIX).inbox
+        return build_redis_runtime(redis_client).inbox
 
     @pytest.fixture
     def append_raw(self, redis_client: FakeRedis) -> AppendRaw:
         async def _append(session_id: SessionId, payload: str) -> str:
-            return str(await redis_client.xadd(f'{PREFIX}inbox:{session_id}', {'data': payload}))
+            return str(await redis_client.xadd(f'inbox:{session_id}', {'data': payload}))
 
         return _append
 
@@ -454,42 +450,15 @@ class TestBuiltRedisInbox(InboxConformance):
 class TestBuiltRedisSessionLock(LockConformance):
     @pytest.fixture
     def lock(self, redis_client: FakeRedis) -> SessionLock:
-        return build_redis_runtime(redis_client, key_prefix=PREFIX).lock
+        return build_redis_runtime(redis_client).lock
 
     @pytest.fixture
     def advance_time(self, redis_server: TimeControlledServer) -> Callable[[float], None]:
         return redis_server.advance
 
 
-async def test_rz_27_every_key_and_channel_carries_the_prefix(redis_client: FakeRedis) -> None:
-    clock = FakeClock()
-    runtime = build_redis_runtime(redis_client, key_prefix=PREFIX, clock=clock)
-    wakeups = redis_client.pubsub()
-    await wakeups.psubscribe('*inbox-wakeup:*')
-    flow = FlowDefinition(name='rz-flow', operators=(), completes_when=ChatAnswerDataPoint, park_after=5.0)
-    manager = SessionOrchestrationManager(runtime)
-
-    parked = await manager.start_session(session_id=RZ, namespace_id=RZ_NAMESPACE, flow=flow, seed=[work_email()])
-    delivered = await manager.deliver(
-        session_id=RZ, namespace_id=RZ_NAMESPACE, data_point=chat_answer('answer'), flow=flow
-    )
-    await runtime.store.set_watermark(RZ, RZ_OP, Revision(1), epoch=Epoch(9))
-    await RedisCooldownGate(redis_client, key_prefix=PREFIX).try_acquire('gate', 10.0)
-    await RedisRateLimiter(redis_client, clock, rate_per_second=1.0, burst=1, key_prefix=PREFIX).acquire('api')
-
-    assert parked.status is SessionStatus.PARKED and delivered is not None
-    keys = await redis_client.keys('*')
-    assert keys and all(key.startswith(PREFIX) for key in keys)
-    channels = []
-    while (message := await wakeups.get_message(timeout=0.01)) is not None:
-        if message['type'] == 'pmessage':
-            channels.append(message['channel'])
-    assert channels and set(channels) == {f'{PREFIX}inbox-wakeup:{RZ}'}
-    await wakeups.aclose()
-
-
 async def test_rz_28_an_applied_inbox_is_trimmed_and_expires(redis_client: FakeRedis) -> None:
-    runtime = build_redis_runtime(redis_client, key_prefix=PREFIX, clock=FakeClock())
+    runtime = build_redis_runtime(redis_client, clock=FakeClock())
     for index in range(3):
         await runtime.inbox.append(RZ, chat_answer(f'answer-{index}'))
 
@@ -502,8 +471,8 @@ async def test_rz_28_an_applied_inbox_is_trimmed_and_expires(redis_client: FakeR
     ).run()
 
     assert result.status is SessionStatus.COMPLETED
-    assert await redis_client.xlen(f'{PREFIX}inbox:{RZ}') == 0  # none of the applied deliveries stay
-    assert await redis_client.pttl(f'{PREFIX}inbox:{RZ}') > 0
+    assert await redis_client.xlen(f'inbox:{RZ}') == 0  # none of the applied deliveries stay
+    assert await redis_client.pttl(f'inbox:{RZ}') > 0
     assert await runtime.inbox.pending_count(RZ) == 0
 
 

@@ -47,9 +47,7 @@ Fixes for sessions that live for minutes to hours, across pods and deploys.
   mapping or pydantic-model value that make its identity. The first value for an identity is kept;
   a later, different value is dropped (`MergeKind.DROPPED`) and logged. Without it, identity stays
   the whole value.
-- **A Redis key prefix.** Every Redis adapter takes `key_prefix` (default none, the 0.1.1 layout),
-  applied to every key and pub/sub channel.
-- **`build_redis_runtime`** (`orcastork.adapters.redis`): one client, one prefix, one state TTL,
+- **`build_redis_runtime`** (`orcastork.adapters.redis`): one client and one state TTL,
   wiring the store, inbox and lock, with no-op audit, archive and durable store ports.
 - **`NullAuditSink`, `NullDataPointArchive`, `NullDurableStore`** (`orcastork.ports`).
 - `UnhashableValueError`, `SessionStatus.RUNNING`, `DataPoint.identity`, `identity_string`.

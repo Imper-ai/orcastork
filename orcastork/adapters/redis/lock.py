@@ -41,28 +41,25 @@ _COMPLETE = (
 
 class RedisSessionLock:
     def __init__(
-        self,
-        redis: Redis,
-        *,
-        ttl_ms: int = DEFAULT_TTL_MS,
-        state_ttl_ms: int = DEFAULT_STATE_TTL_MS,
-        key_prefix: str = '',
+        self, redis: Redis, *, ttl_ms: int = DEFAULT_TTL_MS, state_ttl_ms: int = DEFAULT_STATE_TTL_MS
     ) -> None:
         self._redis: Any = redis  # see RedisDataPointStore: redis-py's sync/async union typing
         self._ttl_ms = ttl_ms
-        self._prefix = key_prefix
         # The lease (`lock` key) lives for ttl_ms; the mint/complete counters outlive it by state_ttl_ms
         # so fencing stays monotonic and completion stays readable well beyond any recovery window.
         self._state_ttl_ms = state_ttl_ms
 
-    def _lock_key(self, session_id: SessionId) -> str:
-        return f'{self._prefix}lock:{session_id}'
+    @staticmethod
+    def _lock_key(session_id: SessionId) -> str:
+        return f'lock:{session_id}'
 
-    def _mint_key(self, session_id: SessionId) -> str:
-        return f'{self._prefix}mint:{session_id}'
+    @staticmethod
+    def _mint_key(session_id: SessionId) -> str:
+        return f'mint:{session_id}'
 
-    def _complete_key(self, session_id: SessionId) -> str:
-        return f'{self._prefix}complete:{session_id}'
+    @staticmethod
+    def _complete_key(session_id: SessionId) -> str:
+        return f'complete:{session_id}'
 
     async def acquire(self, session_id: SessionId) -> Epoch:
         epoch = int(

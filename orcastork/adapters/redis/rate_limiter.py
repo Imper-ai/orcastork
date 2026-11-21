@@ -47,9 +47,7 @@ return wait_ms
 
 
 class RedisRateLimiter:
-    def __init__(
-        self, redis: Redis, clock: Clock, *, rate_per_second: float, burst: int, key_prefix: str = ''
-    ) -> None:
+    def __init__(self, redis: Redis, clock: Clock, *, rate_per_second: float, burst: int) -> None:
         if rate_per_second <= 0.0:
             raise ValueError(f'rate_per_second must be > 0.0, got {rate_per_second}')
         if burst < 1:
@@ -60,7 +58,6 @@ class RedisRateLimiter:
         self._clock = clock
         self._rate_per_ms = rate_per_second / 1000.0
         self._burst = burst
-        self._prefix = key_prefix
         # Once a full refill's worth of time has passed, the stored state equals the absent-key
         # default (a full bucket), so expiring then loses nothing and bounds Redis growth.
         self._ttl_ms = math.ceil(burst / self._rate_per_ms)
@@ -74,7 +71,7 @@ class RedisRateLimiter:
                 await self._redis.eval(
                     _ACQUIRE_SCRIPT,
                     1,
-                    f'{self._prefix}ratelimit:{key}',
+                    f'ratelimit:{key}',
                     str(now_ms),
                     str(self._rate_per_ms),
                     str(self._burst),

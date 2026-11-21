@@ -12,13 +12,8 @@ from redis.asyncio import Redis
 
 
 class RedisCooldownGate:
-    def __init__(self, redis: Redis, *, key_prefix: str = '') -> None:
+    def __init__(self, redis: Redis) -> None:
         self._redis: Any = redis  # see RedisDataPointStore: redis-py's sync/async union typing
-        self._prefix = key_prefix
 
     async def try_acquire(self, key: str, cooldown_seconds: float) -> bool:
-        return bool(
-            await self._redis.set(
-                f'{self._prefix}cooldown:{key}', '1', nx=True, px=max(int(cooldown_seconds * 1000), 1)
-            )
-        )
+        return bool(await self._redis.set(f'cooldown:{key}', '1', nx=True, px=max(int(cooldown_seconds * 1000), 1)))

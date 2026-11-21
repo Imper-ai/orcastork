@@ -43,19 +43,18 @@ rate limiter compose without ceremony.
 
 ## Redis: keyspace and TTLs
 
-**Give orcastork a key prefix, or a database of its own.** Every Redis adapter takes a
-`key_prefix` (none by default), applied to every key and pub/sub channel below. The simplest
-wiring is the builder, which shares one client, prefix and state TTL across the store, inbox and
-lock:
+**Namespace your session ids, or give orcastork a database of its own.** The keys are
+`dp:{session_id}`, `lock:{session_id}` and so on, so every per-session key and channel embeds the
+session id. Session ids that carry a namespace of their own (`my_flow:{id}`) keep a flow's keys
+apart from another workload's in a shared database; bare ids risk colliding with another
+workload's short keys. The simplest wiring is the builder, which shares one client and one state
+TTL across the store, inbox and lock:
 
 ```python
 from orcastork.adapters.redis import build_redis_runtime
 
-runtime = build_redis_runtime(redis, key_prefix='my_flow:', state_ttl_ms=172_800_000)
+runtime = build_redis_runtime(redis, state_ttl_ms=172_800_000)
 ```
-
-Without a prefix the keys are `dp:{session_id}`, `lock:{session_id}` and so on, and if you share
-a database with another workload that uses short keys, you own the collision.
 
 | Key | Holds |
 |---|---|
@@ -212,7 +211,7 @@ renders the graph to stdout, which is worth committing to your own docs.
 
 ## Pre-flight checklist
 
-- [ ] Redis keys carry a `key_prefix`, or Redis has its own logical database
+- [ ] Session ids carry a namespace, or Redis has its own logical database
 - [ ] Redis persistence matches how much in-flight state you can afford to lose
 - [ ] `ttl_ms > operation_timeout` — the defaults are both 30s, i.e. no headroom
 - [ ] The archive has a retention configured, or you have accepted unbounded growth
