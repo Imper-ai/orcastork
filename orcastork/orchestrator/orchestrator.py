@@ -53,6 +53,7 @@ from typing import Any
 
 from loguru import logger
 from opentelemetry.trace import Span, StatusCode
+from pydantic import BaseModel, ConfigDict
 
 from ..aggregation.helpers import AggregationHelpers
 from ..aggregation.retry import RetryPolicy, backoff_delays, run_with_retry, seed_for
@@ -151,10 +152,11 @@ class _Completed:
     cut_by_deadline: bool = False
 
 
-@dataclass(frozen=True)
-class _ArmedRetry:
+class _ArmedRetry(BaseModel):
     """What a relaunch owes the failure it retries: the error to report if it can never run, and the
     revision the failed run observed, which the retry deliberately left un-advanced as its watermark."""
+
+    model_config = ConfigDict(frozen=True, arbitrary_types_allowed=True)
 
     error: Exception
     observed_revision: Revision
@@ -954,7 +956,9 @@ class Orchestrator:
             error=signal.error,
         )
         if retrying and signal.error is not None:
-            self._armed_retries[signal.operator_id] = _ArmedRetry(signal.error, record.observed_revision, attempt)
+            self._armed_retries[signal.operator_id] = _ArmedRetry(
+                error=signal.error, observed_revision=record.observed_revision, attempt=attempt
+            )
         if retrying:
             # A retried failure keeps its old watermark: the failed attempt never durably processed its
             # delta, so the relaunch must re-present the same changes. Its emissions are already merged —
