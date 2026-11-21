@@ -64,6 +64,7 @@ class CapabilityView:
         return matches[0] if matches else None
 
     def _preference_rank(self, capability: Capability) -> tuple[int, CapabilityId]:
+        """Sort key: the namespace's preferred capabilities first, in preference order, then the rest by id."""
         if capability.capability_id in self._preference:
             return (self._preference.index(capability.capability_id), capability.capability_id)
         return (len(self._preference), capability.capability_id)

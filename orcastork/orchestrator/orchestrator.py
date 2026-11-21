@@ -308,6 +308,11 @@ class Orchestrator:
         # The root span covers everything ownership-scoped — acquire, gather, aggregation,
         # the final flushes — so one trace shows the whole run. Per-session identifiers are
         # fine as span attributes (each span stands alone; only metric attributes create series).
+        """Own the session for one run: acquire a higher epoch, gather, then park or aggregate and complete.
+
+        Returns how the run ended, ``SUPERSEDED`` included when a higher epoch takes over. Raises
+        ``LockHeldError`` when a live orchestrator already holds the session.
+        """
         with self._runtime.telemetry.tracer.start_as_current_span(
             'session.run',
             attributes={'session_id': self._session_id, 'namespace_id': self._namespace_id},
@@ -1029,6 +1034,7 @@ class Orchestrator:
         *,
         completion_satisfied: bool,
     ) -> _GatherPlan:
+        """Decide which operators launch this pass, and how long until the soonest armed window comes due."""
         present_types = frozenset(type(data_point) for data_point in view.all())
         available_types = capabilities.available_types()
         runnable: list[_Runnable] = []
@@ -1144,6 +1150,7 @@ class Orchestrator:
         queue: asyncio.Queue[_Emitted | _Completed],
         remaining: float,
     ) -> None:
+        """Run one operator in its fault boundary, queueing each emission and then its completion."""
         aggregation = (
             AggregationHelpers(
                 self._runtime.durable,

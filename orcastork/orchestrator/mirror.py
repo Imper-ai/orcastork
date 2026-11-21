@@ -178,6 +178,7 @@ class SessionStateMirror:
         self._revision = revision
 
     def _local_change_set(self, since: int) -> ChangeSet:
+        """Changes since a revision at or after rehydration, answered from the local stamps alone."""
         added = tuple(entry.data_point for entry in self._entries.values() if entry.added_rev > since)
         updated = tuple(
             entry.data_point for entry in self._entries.values() if entry.added_rev <= since < entry.updated_rev
@@ -185,6 +186,7 @@ class SessionStateMirror:
         return ChangeSet(added=added, updated=updated)
 
     def _baselined_change_set(self, since: int) -> ChangeSet:
+        """Changes since a pre-rehydration revision; raises ``StateMirrorError`` unless its baseline was primed."""
         baseline = self._baselines.get(since)
         if baseline is None:
             raise StateMirrorError(

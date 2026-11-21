@@ -121,6 +121,7 @@ class CapabilityActivator:
         return frozenset(self._activated)
 
     def _may_attempt(self, capability_id: CapabilityId, now: float) -> bool:
+        """Whether activation may be tried now: it never failed, or its non-terminal cool-off has elapsed."""
         failure = self._failures.get(capability_id)
         if failure is None:
             return True

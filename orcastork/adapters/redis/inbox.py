@@ -84,6 +84,7 @@ class RedisStreamsInbox:
         return f'inbox:{session_id}'
 
     async def _ensure_group(self, session_id: SessionId) -> None:
+        """Create the session's consumer group, and its stream, unless it already exists."""
         try:
             await self._redis.xgroup_create(self._stream(session_id), _GROUP, id='0', mkstream=True)
         except ResponseError as error:

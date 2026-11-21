@@ -208,6 +208,7 @@ class RedisDataPointStore:
         return await self._apply(session_id, triples, epoch)
 
     async def _apply(self, session_id: SessionId, triples: Sequence[str], epoch: Epoch) -> Revision:
+        """Write resolved triples atomically; returns the new revision, raises ``StaleEpochError``."""
         epoch_key, rev_key, dp_key, added_key, upd_key = self._keys(session_id)
         result = await self._redis.eval(
             _WRITE_SCRIPT, 5, epoch_key, rev_key, dp_key, added_key, upd_key, int(epoch), *triples
@@ -303,6 +304,7 @@ class RedisDataPointStore:
     async def _run_effect_script(
         self, script: str, session_id: SessionId, effect_key: str, epoch: Epoch, *extra_args: str
     ) -> int:
+        """Run an effect-mark script under the epoch fence; returns its result code, raises ``StaleEpochError``."""
         epoch_key, _, _, _, _ = self._keys(session_id)
         result = await self._redis.eval(
             script, 2, epoch_key, f'fx:{session_id}', str(int(epoch)), effect_key, *extra_args
