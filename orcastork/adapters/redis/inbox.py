@@ -106,12 +106,6 @@ class RedisStreamsInbox:
     def _epoch_key(session_id: SessionId) -> str:
         return f'inbox_epoch:{session_id}'
 
-    @staticmethod
-    def _acked_key(session_id: SessionId) -> str:
-        # Written only by 0.1.1, which counted acks instead of deleting the acked entries; read so a
-        # stream it left behind still reports the right pending count.
-        return f'acked:{session_id}'
-
     async def append(self, session_id: SessionId, data_point: BaseDataPoint[Any]) -> str:
         # The client decodes responses, so payloads flow as str — decode the orjson bytes here.
         payload = orjson.dumps(data_point.model_dump(mode='json')).decode()
@@ -236,9 +230,7 @@ class RedisStreamsInbox:
         return tuple(entries)
 
     async def pending_count(self, session_id: SessionId) -> int:
-        total = int(await self._redis.xlen(self._stream(session_id)))
-        acked = int(await self._redis.get(self._acked_key(session_id)) or 0)
-        return total - acked
+        return int(await self._redis.xlen(self._stream(session_id)))
 
     async def wait_for_entry(self, session_id: SessionId) -> None:
         pubsub = self._redis.pubsub()

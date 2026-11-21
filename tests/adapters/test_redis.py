@@ -482,20 +482,6 @@ async def test_rz_29_a_stream_created_by_a_consume_expires(redis_client: FakeRed
     assert await redis_client.pttl(f'inbox:{RZ}') > 0
 
 
-async def test_rz_30_a_stream_left_by_0_1_1_keeps_its_pending_count(redis_client: FakeRedis) -> None:
-    # 0.1.1 counted acks in `acked:` and kept the acked entries; 0.2.0 deletes them. Both must add up.
-    inbox = RedisStreamsInbox(redis_client)
-    first = await inbox.append(RZ, work_email('a@e.example'))
-    second = await inbox.append(RZ, personal_email('b@e.example'))
-    await inbox.consume(RZ)
-    await redis_client.xack(f'inbox:{RZ}', 'orchestrator', first)
-    await redis_client.set(f'acked:{RZ}', 1)
-    assert await inbox.pending_count(RZ) == 1
-
-    await inbox.ack(RZ, second, epoch=Epoch(1))
-    assert await inbox.pending_count(RZ) == 0
-
-
 async def test_rz_31_a_stored_data_point_of_an_unknown_type_is_skipped(redis_client: FakeRedis) -> None:
     raw: Any = redis_client  # redis-py types its commands as a sync/async union
     store = RedisDataPointStore(redis_client)

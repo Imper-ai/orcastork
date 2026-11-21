@@ -11,23 +11,29 @@ under **Changed** with the migration.
 
 ## [0.2.0]
 
-Fixes for sessions that live for minutes to hours, across pods and deploys.
+Fixes for sessions that live for minutes to hours, across pods and deploys. It breaks backwards
+compatibility with 0.1.1 where marked **Breaking**; nothing depended on 0.1.1, so there is no
+migration path.
 
 ### Changed
 
-- **`start_session` on an existing session no longer starts another run.** A completed session is
+- **Breaking: Redis state written by 0.1.1 is not carried over.** A dict or set value's identity
+  now sorts by `repr`, which changes the Redis field name of some stored DataPoints, and the inbox's
+  pending count is the stream length, no longer reduced by the `acked:` counter 0.1.1 kept. Start
+  0.2.0 on a Redis with no 0.1.1 sessions in it.
+- **Breaking: `start_session` on an existing session no longer starts another run.** A completed session is
   returned as it is (`COMPLETED`, its current epoch, no operator runs), a live one is returned as
   the new `SessionStatus.RUNNING` instead of raising `LockHeldError`, and a parked or orphaned one
   is resumed (without the seed, which it already holds). A session with no state is new, as before.
-  Migration: a caller that relied on `LockHeldError`, or on re-running a completed session through
-  `start_session`, checks the returned status, or calls `reopen` for a completed session.
+  A caller that relied on `LockHeldError`, or on re-running a completed session through
+  `start_session`, checks the returned status instead, or calls `reopen` for a completed session.
 - **The lease is renewed while operators run.** The gathering loop renewed only between passes, so
   an operator that outlived the lock TTL lost its session to another pod, which re-ran it while the
   first was still running. A renewal that finds a higher epoch still stops the run as `SUPERSEDED`.
   The lock TTL no longer has to exceed the longest `OperatorPolicy.timeout`, only `operation_timeout`.
-- **A failed audit write is logged and dropped,** bounded by `Orchestrator(audit_timeout=...)`
+- **Breaking: a failed audit write is logged and dropped,** bounded by `Orchestrator(audit_timeout=...)`
   (5s by default), instead of stalling or crashing the run. A `StaleEpochError` still stops it.
-- **An inbox entry of a DataPoint type this process does not know is delivered as poison** and
+- **Breaking: an inbox entry of a DataPoint type this process does not know is delivered as poison** and
   quarantined, instead of raising out of every pass of the session.
 - The completion tail's per-step log is DEBUG, no longer INFO.
 
@@ -59,7 +65,7 @@ Fixes for sessions that live for minutes to hours, across pods and deploys.
   now gathered on the same epoch.
 - **The Redis inbox stream is trimmed** as entries are applied or quarantined, and a stream created
   by a read expires with the session state. It used to grow by one entry per delivery, and a stream
-  created by a read never expired. A stream written by 0.1.1 keeps counting correctly.
+  created by a read never expired.
 - **A stored DataPoint of an unknown type is skipped with a warning** on every Redis store read
   (rehydrate, snapshot, change set) instead of failing the whole session, so a deploy that adds a
   type can be rolled back.

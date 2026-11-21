@@ -18,7 +18,6 @@ lets :mod:`.registry` rebuild the discriminated-union ``TypeAdapter`` lazily.
 
 from __future__ import annotations
 
-from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, ClassVar, Self
@@ -62,16 +61,6 @@ class DataPointTypeConfig:
     identity_fields: tuple[str, ...] = ()
 
 
-def _sorted(items: Iterable[Any]) -> list[Any]:
-    # Natural order first, so a homogeneous value keeps the canonical form (and the Redis field) it had;
-    # repr is the fallback for a mix of types that cannot be compared with each other.
-    materialized = list(items)
-    try:
-        return sorted(materialized)
-    except TypeError:
-        return sorted(materialized, key=repr)
-
-
 def _make_hashable(obj: Any) -> Any:
     """Recursively coerce a value into a hashable, order-insensitive form (lists/dicts/sets → tuples).
 
@@ -81,10 +70,11 @@ def _make_hashable(obj: Any) -> Any:
     """
     if isinstance(obj, (list, tuple)):
         return tuple(_make_hashable(item) for item in obj)
+    # Sorted by repr: a set may mix types that cannot be compared with each other.
     if isinstance(obj, dict):
-        return tuple(_sorted((key, _make_hashable(value)) for key, value in obj.items()))
+        return tuple(sorted(((key, _make_hashable(value)) for key, value in obj.items()), key=repr))
     if isinstance(obj, (set, frozenset)):
-        return tuple(_sorted(_make_hashable(item) for item in obj))
+        return tuple(sorted((_make_hashable(item) for item in obj), key=repr))
     if isinstance(obj, BaseModel):
         return _make_hashable(obj.model_dump())
     try:
@@ -130,11 +120,7 @@ def identity_key(data_point: 'BaseDataPoint[Any]') -> tuple[DataPointType, Any]:
 
 
 def identity_string(data_point: 'BaseDataPoint[Any]') -> str:
-    """The process-stable string form of :func:`identity_key`, for string-keyed stores.
-
-    For a type with no ``identity_fields`` it is :func:`canonical_value` of the whole value, the
-    form 0.1.1 stored, so existing sessions keep their keys.
-    """
+    """The process-stable string form of :func:`identity_key`, for string-keyed stores."""
     return repr(data_point.identity[1])
 
 

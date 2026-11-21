@@ -69,7 +69,6 @@ runtime = build_redis_runtime(redis, state_ttl_ms=172_800_000)
 | `inbox:{session}` | Mid-session input (a Stream with a consumer group); an entry is deleted once applied or quarantined |
 | `inbox-wakeup:{session}` | Pub/sub channel that wakes a session waiting on its inbox |
 | `inbox_epoch:{session}`, `quarantine:{session}` | Inbox fencing epoch and poison quarantine |
-| `acked:{session}` | Ack count of a stream written by 0.1.1, read only so such a stream still counts right |
 | `cooldown:{key}` | The manager's scheduling gate |
 | `ratelimit:{key}` | Token-bucket state for capability pacing |
 
