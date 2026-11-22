@@ -53,6 +53,14 @@ migration path.
   wiring the store, inbox and lock, with no-op audit, archive and durable store ports.
 - **`NullAuditSink`, `NullDataPointArchive`, `NullDurableStore`** (`orcastork.ports`).
 - `UnhashableValueError`, `SessionStatus.RUNNING`, `DataPoint.identity`.
+- **A re-drive for input no orchestrator processed.** `SessionOrchestrationManager.redrive_stalled` resumes
+  the sessions holding unacked inbox entries that no live orchestrator owns, read oldest first from a
+  pending-input index that `Inbox.append(..., namespace_id=...)` fills and the draining ack or
+  quarantine empties (`Inbox.find_pending`, `Inbox.drop_pending`, `PendingSession`). It is the host's
+  periodic backstop for an owner and a delivering pod that both died with input unread. `deliver`
+  now indexes what it appends.
+- **`append_input` and `drive`**, the two halves of `deliver`, so an ingress can answer once its
+  input is durable and drive the session in the background.
 
 ### Fixed
 

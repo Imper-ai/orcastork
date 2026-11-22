@@ -36,6 +36,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from loguru import logger
+from opentelemetry.trace import Span
 
 from ..datapoints import BaseDataPoint
 from ..exceptions import LockHeldError, SchedulingGateBlockedError
@@ -384,7 +385,8 @@ class SessionOrchestrationManager:
         a resume once its lease frees. An orphaned session is resumed on this pod and the result returned. A
         *parked* session holds no lock and is not complete, so the orphan branch covers it: the delivery
         itself resumes the session with the new entry folded in. Callers on a request path typically wrap
-        this in ``asyncio.create_task``.
+        this in ``asyncio.create_task``, or await ``append_input`` themselves and run ``drive`` in the
+        background, so the request answers once the input is durable.
         """
         with self._runtime.telemetry.tracer.start_as_current_span(
             'session.deliver',
@@ -395,49 +397,122 @@ class SessionOrchestrationManager:
                 'data_point_type': data_point.type,
             },
         ) as span:
-            await self._runtime.inbox.append(session_id, data_point)
-            logger.debug(
-                'DataPoint delivered to the session inbox',
-                session_id=session_id,
+            await self.append_input(session_id=session_id, namespace_id=namespace_id, data_point=data_point)
+            return await self._drive(
+                span,
+                session_id,
+                namespace_id,
+                flow,
+                reopen_if_complete=reopen_if_complete,
                 data_point_type=data_point.type,
             )
-            if await self._runtime.lock.is_complete(session_id):
-                if reopen_if_complete:
-                    # The caller declares this late data affects the durable result (e.g. the participant
-                    # endpoint delivering NAME / WORK_EMAIL): re-open so the aggregator re-runs and folds it in.
-                    # reopen is a free-lock spawn — it stands down if the lock is still held, because a
-                    # completing holder drains its own inbox before releasing the epoch, so a deliver landing in
-                    # that window is folded in-run without any deliver-side recheck.
-                    span.set_attribute('disposition', 'reopened_for_late_data')
-                    return await self.reopen(session_id=session_id, namespace_id=namespace_id, flow=flow)
-                # No re-open requested: the entry is durably appended but a completed session will not be
-                # re-driven for it, so it expires unprocessed.
-                span.set_attribute('disposition', 'already_complete_no_reopen')
-                logger.info(
-                    'Delivery to a completed session without a re-open request; the entry will expire unprocessed',
-                    session_id=session_id,
-                    data_point_type=data_point.type,
+
+    async def append_input(
+        self, *, session_id: SessionId, namespace_id: NamespaceId, data_point: BaseDataPoint[Any]
+    ) -> None:
+        """Append mid-session input durably, and index the session as holding input not yet processed.
+
+        The first half of ``deliver``: once this returns, the input survives this process. Nothing
+        drives the session yet — follow it with ``drive``, or leave it to ``redrive_stalled``.
+        """
+        await self._runtime.inbox.append(session_id, data_point, namespace_id=namespace_id)
+        logger.debug(
+            'DataPoint delivered to the session inbox', session_id=session_id, data_point_type=data_point.type
+        )
+
+    async def drive(
+        self,
+        *,
+        session_id: SessionId,
+        namespace_id: NamespaceId,
+        flow: FlowDefinition,
+        reopen_if_complete: bool = False,
+    ) -> OrchestratorResult | None:
+        """Make sure some orchestrator processes the session's appended input: the second half of ``deliver``."""
+        with self._runtime.telemetry.tracer.start_as_current_span(
+            'session.drive',
+            attributes={'session_id': session_id, 'namespace_id': namespace_id, 'flow_name': flow.name},
+        ) as span:
+            return await self._drive(span, session_id, namespace_id, flow, reopen_if_complete=reopen_if_complete)
+
+    async def _drive(
+        self,
+        span: Span,
+        session_id: SessionId,
+        namespace_id: NamespaceId,
+        flow: FlowDefinition,
+        *,
+        reopen_if_complete: bool,
+        data_point_type: str | None = None,
+    ) -> OrchestratorResult | None:
+        if await self._runtime.lock.is_complete(session_id):
+            if reopen_if_complete:
+                # The caller declares this late data affects the durable result (e.g. the participant
+                # endpoint delivering NAME / WORK_EMAIL): re-open so the aggregator re-runs and folds it in.
+                # reopen is a free-lock spawn — it stands down if the lock is still held, because a
+                # completing holder drains its own inbox before releasing the epoch, so a deliver landing in
+                # that window is folded in-run without any deliver-side recheck.
+                span.set_attribute('disposition', 'reopened_for_late_data')
+                return await self.reopen(session_id=session_id, namespace_id=namespace_id, flow=flow)
+            # No re-open requested: the entry is durably appended but a completed session will not be
+            # re-driven for it, so it expires unprocessed.
+            span.set_attribute('disposition', 'already_complete_no_reopen')
+            logger.info(
+                'Delivery to a completed session without a re-open request; the entry will expire unprocessed',
+                session_id=session_id,
+                data_point_type=data_point_type,
+            )
+            return None
+        if await self._runtime.lock.is_held(session_id):
+            span.set_attribute('disposition', 'owner_notified')
+            logger.debug(
+                'Delivery left to the live session owner; a redelivery recheck is scheduled',
+                session_id=session_id,
+                recheck_seconds=self._redelivery_recheck_seconds,
+            )
+            # Carry the caller's re-open intent into the deferred re-drive. By the time it fires the
+            # holder may have COMPLETED rather than died, and `resume` refuses a completed session — so
+            # redriving with `resume` alone silently drops an entry the caller was told was delivered.
+            self._schedule_recheck(
+                session_id=session_id,
+                namespace_id=namespace_id,
+                flow=flow,
+                redrive=self._reopen_or_resume if reopen_if_complete else self.resume,
+            )
+            return None
+        span.set_attribute('disposition', 'resumed')
+        return await self.resume(session_id=session_id, namespace_id=namespace_id, flow=flow)
+
+    async def redrive_stalled(self, *, limit: int, flow_for: Callable[[SessionId], FlowDefinition]) -> int:
+        """Resume the sessions holding unprocessed input that no live orchestrator owns: the host's periodic re-drive.
+
+        Reads up to ``limit`` sessions from the inbox's pending-input index, oldest first. A completed session,
+        or one whose inbox expired empty, leaves the index with no resume, and a held one is left to its owner.
+        ``flow_for`` names the flow a session runs. Returns how many sessions it resumed. A failed resume is
+        logged and the next session is tried, so one bad session cannot stall the rest.
+        """
+        resumed = 0
+        for pending in await self._runtime.inbox.find_pending(limit):
+            session_id = pending.session_id
+            try:
+                is_settled = (
+                    await self._runtime.lock.is_complete(session_id)
+                    or await self._runtime.inbox.pending_count(session_id) == 0
                 )
-                return None
-            if await self._runtime.lock.is_held(session_id):
-                span.set_attribute('disposition', 'owner_notified')
-                logger.debug(
-                    'Delivery left to the live session owner; a redelivery recheck is scheduled',
-                    session_id=session_id,
-                    recheck_seconds=self._redelivery_recheck_seconds,
+                if is_settled:
+                    await self._runtime.inbox.drop_pending(session_id)
+                    continue
+                if await self._runtime.lock.is_held(session_id):
+                    continue
+                result = await self.resume(
+                    session_id=session_id, namespace_id=pending.namespace_id, flow=flow_for(session_id)
                 )
-                # Carry the caller's re-open intent into the deferred re-drive. By the time it fires the
-                # holder may have COMPLETED rather than died, and `resume` refuses a completed session — so
-                # redriving with `resume` alone silently drops an entry the caller was told was delivered.
-                self._schedule_recheck(
-                    session_id=session_id,
-                    namespace_id=namespace_id,
-                    flow=flow,
-                    redrive=self._reopen_or_resume if reopen_if_complete else self.resume,
-                )
-                return None
-            span.set_attribute('disposition', 'resumed')
-            return await self.resume(session_id=session_id, namespace_id=namespace_id, flow=flow)
+            except Exception:
+                logger.exception('Re-driving a session with unprocessed input failed', session_id=session_id)
+                continue
+            if result is not None:
+                resumed += 1
+        return resumed
 
     async def _reopen_or_resume(
         self,

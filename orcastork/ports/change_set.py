@@ -7,6 +7,7 @@ from datetime import datetime
 from typing import Any, TypeAlias
 
 from ..datapoints import BaseDataPoint
+from ..ids import NamespaceId, SessionId
 
 
 @dataclass(frozen=True)
@@ -60,6 +61,14 @@ class QuarantinedEntry:
     reason: str
     delivery_count: int
     raw_payload: str | None = None  # the original wire payload, when cheaply available
+
+
+@dataclass(frozen=True)
+class PendingSession:
+    """A session holding inbox entries no orchestrator has acked yet, and the namespace it runs in."""
+
+    session_id: SessionId
+    namespace_id: NamespaceId
 
 
 @dataclass(frozen=True)

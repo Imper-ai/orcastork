@@ -389,8 +389,15 @@ owner is woken by the inbox push; an orphaned **or parked** session (no lock, no
 is resumed right there on the delivering pod under a fresh fencing epoch, with one deferred
 recheck covering an owner that died (or parked) in the delivery window. Losing a resume race
 never raises — exactly one pod drives the session, and redelivery is harmless (reclaim +
-keyed-merge apply each entry once in effect). A host-level periodic re-drive of its open
-sessions remains the backstop for double failures.
+keyed-merge apply each entry once in effect). An ingress that must answer only once the input
+is durable awaits `manager.append_input(...)` and runs `manager.drive(...)` in the background:
+together they are `deliver`.
+
+The backstop for a double failure (the owner and the delivering pod both die with an entry unread)
+is the host's periodic `manager.redrive_stalled(limit=..., flow_for=...)`. Every append that names
+its namespace, as `deliver` does, enters the session in a pending-input index until an ack drains
+its inbox, so the re-drive reads only the sessions that hold unprocessed input, oldest first, and
+resumes those no live orchestrator owns.
 
 The next three sections are the full authoring + testing guide for each type.
 
