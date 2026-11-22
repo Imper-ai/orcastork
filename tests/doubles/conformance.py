@@ -39,6 +39,7 @@ from orcastork.ports import (
     EffectClaim,
     Inbox,
     InboxEntry,
+    PendingSession,
     PoisonInboxEntry,
     SessionLock,
 )
@@ -533,6 +534,51 @@ class InboxConformance:
         assert [record.reason for record in records] == ['poison bytes', 'apply kept failing']
         assert records[0].raw_payload == 'not-json{'  # the poison's own malformed bytes
         assert records[1].raw_payload is not None and 'a@e.example' in records[1].raw_payload
+
+    async def test_inbox_21_an_append_with_a_namespace_is_found_pending(self, inbox: Inbox) -> None:
+        await inbox.append(SID, work_email('a@e.example'), namespace_id=NAMESPACE)
+
+        assert await inbox.find_pending(10) == (PendingSession(SID, NAMESPACE),)
+
+    async def test_inbox_22_an_append_without_a_namespace_is_never_pending(self, inbox: Inbox) -> None:
+        await inbox.append(SID, work_email('a@e.example'))
+
+        assert await inbox.find_pending(10) == ()
+
+    async def test_inbox_23_the_ack_that_drains_the_inbox_ends_pending(self, inbox: Inbox) -> None:
+        first = await inbox.append(SID, work_email('a@e.example'), namespace_id=NAMESPACE)
+        second = await inbox.append(SID, personal_email('p@e.example'), namespace_id=NAMESPACE)
+        await inbox.consume(SID)
+
+        await inbox.ack(SID, first, epoch=Epoch(1))
+        assert await inbox.find_pending(10) == (PendingSession(SID, NAMESPACE),)
+        await inbox.ack(SID, second, epoch=Epoch(1))
+        assert await inbox.find_pending(10) == ()
+
+    async def test_inbox_24_the_quarantine_that_drains_the_inbox_ends_pending(self, inbox: Inbox) -> None:
+        entry_id = await inbox.append(SID, work_email('a@e.example'), namespace_id=NAMESPACE)
+        await inbox.consume(SID)
+
+        await inbox.quarantine(SID, entry_id, reason='apply kept failing', epoch=Epoch(1))
+
+        assert await inbox.find_pending(10) == ()
+
+    async def test_inbox_25_pending_sessions_come_oldest_first_up_to_the_limit(self, inbox: Inbox) -> None:
+        await inbox.append(SID, work_email('a@e.example'), namespace_id=NAMESPACE)
+        await inbox.append(OTHER_SID, work_email('b@e.example'), namespace_id=NAMESPACE)
+        # A later append to an already pending session keeps its place.
+        await inbox.append(SID, personal_email('p@e.example'), namespace_id=NAMESPACE)
+
+        assert await inbox.find_pending(10) == (PendingSession(SID, NAMESPACE), PendingSession(OTHER_SID, NAMESPACE))
+        assert await inbox.find_pending(1) == (PendingSession(SID, NAMESPACE),)
+
+    async def test_inbox_26_drop_pending_ends_pending_and_keeps_the_entries(self, inbox: Inbox) -> None:
+        await inbox.append(SID, work_email('a@e.example'), namespace_id=NAMESPACE)
+
+        await inbox.drop_pending(SID)
+
+        assert await inbox.find_pending(10) == ()
+        assert await inbox.pending_count(SID) == 1
 
 
 class CooldownGateConformance:

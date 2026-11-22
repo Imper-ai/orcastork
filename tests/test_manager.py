@@ -24,6 +24,7 @@ from orcastork.manager import manager as manager_module
 from orcastork.operators import Operator, OperatorContext
 from orcastork.orchestrator import Orchestrator
 from orcastork.orchestrator.orchestrator import SessionStatus
+from orcastork.ports import PendingSession
 from orcastork.runtime import OrchestratorRuntime, build_in_memory_runtime
 
 from .doubles.capabilities import make_capability
@@ -1105,3 +1106,63 @@ async def test_mgr_a_straggler_delivered_to_a_held_session_that_then_completes_i
 
     # The caller was told this was delivered, so it has to actually land.
     assert await runtime.inbox.pending_count(SID) == 0
+
+
+async def test_mgr_38_append_input_then_drive_processes_the_input_as_deliver_does(fake_clock: FakeClock) -> None:
+    runtime = build_in_memory_runtime(fake_clock)
+    manager = SessionOrchestrationManager(runtime)
+    await _simulate_crashed_predecessor(runtime, fake_clock)
+    flow = _flow(_scorer())
+
+    await manager.append_input(session_id=SID, namespace_id=NAMESPACE, data_point=_trigger())
+    assert await runtime.inbox.pending_count(SID) == 1
+    result = await manager.drive(session_id=SID, namespace_id=NAMESPACE, flow=flow)
+
+    assert result is not None and result.status is SessionStatus.COMPLETED
+    assert await runtime.inbox.pending_count(SID) == 0
+    assert await runtime.inbox.find_pending(10) == ()
+
+
+async def test_mgr_39_redrive_resumes_an_orphaned_session_holding_input(fake_clock: FakeClock) -> None:
+    # The owner died with input unread and the delivering pod's recheck died with it: only the host's
+    # periodic re-drive is left to process it.
+    runtime = build_in_memory_runtime(fake_clock)
+    manager = SessionOrchestrationManager(runtime)
+    await _simulate_crashed_predecessor(runtime, fake_clock)
+    await manager.append_input(session_id=SID, namespace_id=NAMESPACE, data_point=_trigger())
+    flow = _flow(_scorer())
+
+    resumed = await manager.redrive_stalled(limit=10, flow_for=lambda _session_id: flow)
+
+    assert resumed == 1
+    assert await runtime.lock.is_complete(SID)
+    assert await runtime.inbox.find_pending(10) == ()
+
+
+async def test_mgr_40_redrive_leaves_a_held_session_to_its_owner(fake_clock: FakeClock) -> None:
+    runtime = build_in_memory_runtime(fake_clock)
+    manager = SessionOrchestrationManager(runtime)
+    await _simulate_crashed_predecessor(runtime, fake_clock)
+    await manager.append_input(session_id=SID, namespace_id=NAMESPACE, data_point=_trigger())
+    await runtime.lock.acquire(SID)
+    flow = _flow(_scorer())
+
+    resumed = await manager.redrive_stalled(limit=10, flow_for=lambda _session_id: flow)
+
+    assert resumed == 0
+    assert await runtime.inbox.find_pending(10) == (PendingSession(SID, NAMESPACE),)
+
+
+async def test_mgr_41_redrive_drops_a_completed_session_without_resuming_it(fake_clock: FakeClock) -> None:
+    runtime = build_in_memory_runtime(fake_clock)
+    manager = SessionOrchestrationManager(runtime)
+    flow = _flow(_scorer())
+    await manager.start_session(session_id=SID, namespace_id=NAMESPACE, flow=flow, seed=[work_email()])
+    await manager.append_input(session_id=SID, namespace_id=NAMESPACE, data_point=_trigger())
+
+    resumed = await manager.redrive_stalled(limit=10, flow_for=lambda _session_id: flow)
+
+    assert resumed == 0
+    assert await runtime.inbox.find_pending(10) == ()
+    # Left to expire unprocessed, as a deliver to a completed session without a re-open request is.
+    assert await runtime.inbox.pending_count(SID) == 1

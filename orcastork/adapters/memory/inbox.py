@@ -5,7 +5,8 @@ claimed-but-unacked entries (crash recovery), bumping their delivery count so po
 messages surface; ``ack`` (epoch-guarded) removes a claimed entry, and is a safe no-op on
 an unclaimed one (Redis ``XACK`` semantics). Append sets a per-session
 arrival event that ``wait_for_entry`` blocks on — a push wakeup, no polling — but
-delivery never depends on it.
+delivery never depends on it. An append that names its namespace indexes the session as pending,
+ordered by an append counter, until the ack or quarantine that empties its inbox.
 
 Messages are held in their serialized wire form (what a stateless front door would put on a
 real transport), so delivery exercises the same tolerant-reader path as the Redis adapter:
@@ -25,8 +26,14 @@ import orjson
 
 from ...datapoints import BaseDataPoint, parse_data_point
 from ...exceptions import StaleEpochError, UnknownDataPointTypeError
-from ...ids import Epoch, SessionId
-from ...ports.change_set import DeliveredInboxEntry, InboxEntry, PoisonInboxEntry, QuarantinedEntry
+from ...ids import Epoch, NamespaceId, SessionId
+from ...ports.change_set import (
+    DeliveredInboxEntry,
+    InboxEntry,
+    PendingSession,
+    PoisonInboxEntry,
+    QuarantinedEntry,
+)
 
 
 @dataclass
@@ -45,9 +52,17 @@ class _InboxState:
     arrival: asyncio.Event = field(default_factory=asyncio.Event)
 
 
+@dataclass(frozen=True)
+class _PendingMark:
+    order: int  # the append counter at the session's oldest unacked entry
+    namespace_id: NamespaceId
+
+
 class InMemoryInbox:
     def __init__(self) -> None:
         self._sessions: dict[SessionId, _InboxState] = {}
+        self._pending: dict[SessionId, _PendingMark] = {}
+        self._append_count = 0
 
     def _state(self, session_id: SessionId) -> _InboxState:
         return self._sessions.setdefault(session_id, _InboxState())
@@ -59,11 +74,16 @@ class InMemoryInbox:
         state.max_epoch = epoch
         return state
 
-    async def append(self, session_id: SessionId, data_point: BaseDataPoint[Any]) -> str:
+    async def append(
+        self, session_id: SessionId, data_point: BaseDataPoint[Any], *, namespace_id: NamespaceId | None = None
+    ) -> str:
         # The wire form is str (what a real transport would carry) — decode the orjson bytes here.
-        return await self.append_serialized(session_id, orjson.dumps(data_point.model_dump(mode='json')).decode())
+        payload = orjson.dumps(data_point.model_dump(mode='json')).decode()
+        return await self.append_serialized(session_id, payload, namespace_id=namespace_id)
 
-    async def append_serialized(self, session_id: SessionId, payload: str) -> str:
+    async def append_serialized(
+        self, session_id: SessionId, payload: str, *, namespace_id: NamespaceId | None = None
+    ) -> str:
         """Append a raw wire payload — the seam a foreign producer writes through.
 
         This is what a direct ``XADD`` is for the Redis adapter: the producer may run newer
@@ -72,6 +92,9 @@ class InMemoryInbox:
         state = self._state(session_id)
         entry_id = str(uuid4())
         state.messages.append(_Message(entry_id=entry_id, payload=payload))
+        self._append_count += 1
+        if namespace_id is not None and session_id not in self._pending:
+            self._pending[session_id] = _PendingMark(self._append_count, namespace_id)
         state.arrival.set()
         return entry_id
 
@@ -123,6 +146,7 @@ class InMemoryInbox:
                 # races ahead of delivery is a safe no-op and the entry stays deliverable.
                 if message.claimed:
                     del state.messages[index]  # ack removes the entry — acked messages must not accumulate
+                    self._drop_pending_if_drained(session_id, state)
                 return
         # Unknown / already-acked entry is a safe no-op.
 
@@ -136,6 +160,7 @@ class InMemoryInbox:
                 if not message.claimed:
                     return
                 del state.messages[index]  # out of delivery for good — quarantine is terminal, unlike un-acked
+                self._drop_pending_if_drained(session_id, state)
                 state.quarantined.append(
                     QuarantinedEntry(
                         entry_id=entry_id,
@@ -152,6 +177,17 @@ class InMemoryInbox:
 
     async def pending_count(self, session_id: SessionId) -> int:
         return len(self._state(session_id).messages)
+
+    async def find_pending(self, limit: int) -> tuple[PendingSession, ...]:
+        oldest_first = sorted(self._pending.items(), key=lambda item: item[1].order)[: max(limit, 0)]
+        return tuple(PendingSession(session_id, mark.namespace_id) for session_id, mark in oldest_first)
+
+    async def drop_pending(self, session_id: SessionId) -> None:
+        self._pending.pop(session_id, None)
+
+    def _drop_pending_if_drained(self, session_id: SessionId, state: _InboxState) -> None:
+        if not state.messages:
+            self._pending.pop(session_id, None)
 
     async def wait_for_entry(self, session_id: SessionId) -> None:
         state = self._state(session_id)

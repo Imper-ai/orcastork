@@ -170,8 +170,10 @@ What each process must do:
   accordingly. A DataPoint type is the exception: a process that meets a stored or delivered
   type it does not know skips it with a warning (a delivered one is quarantined), so adding a
   type can still be rolled back. Never reshape or remove a type a live session may hold.
-- **Call `resume` for orphaned sessions on some schedule.** A crashed or parked session is
-  re-driven when someone asks; the manager does not poll on its own.
+- **Call `redrive_stalled` on some schedule.** A crashed or parked session is re-driven when
+  someone asks; the manager does not poll on its own. `redrive_stalled` resumes the ones holding
+  input no orchestrator processed, read from the inbox's pending-input index, so a schedule of a
+  minute costs nothing while nothing is stuck.
 
 ## Telemetry exporters
 

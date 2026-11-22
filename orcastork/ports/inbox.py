@@ -13,6 +13,12 @@ session). Semantic deserialization failures (an unknown DataPoint type, a valida
 propagate instead — those must fail fast, and redelivery on resume lets a newer deployment
 parse them. The consumer disposes of poison entries via ``quarantine``, which removes them
 from delivery while keeping them durably inspectable through ``quarantined``.
+
+An append that names its session's namespace also enters the session in a pending-input index,
+which ``find_pending`` reads oldest first. The ack or quarantine that empties the session's inbox
+removes it in the same atomic step. The index is what lets a host re-drive a session whose
+owner died with input unread (``SessionOrchestrationManager.redrive_stalled``) without
+scanning every session.
 """
 
 from __future__ import annotations
@@ -20,13 +26,19 @@ from __future__ import annotations
 from typing import Any, Protocol
 
 from ..datapoints import BaseDataPoint
-from ..ids import Epoch, SessionId
-from .change_set import DeliveredInboxEntry, QuarantinedEntry
+from ..ids import Epoch, NamespaceId, SessionId
+from .change_set import DeliveredInboxEntry, PendingSession, QuarantinedEntry
 
 
 class Inbox(Protocol):
-    async def append(self, session_id: SessionId, data_point: BaseDataPoint[Any]) -> str:
-        """Append a DataPoint to the session inbox (+publish wakeup); returns the entry id."""
+    async def append(
+        self, session_id: SessionId, data_point: BaseDataPoint[Any], *, namespace_id: NamespaceId | None = None
+    ) -> str:
+        """Append a DataPoint to the session inbox (+publish wakeup); returns the entry id.
+
+        With ``namespace_id``, the session also enters the pending-input index, in the same atomic step,
+        ordered by its oldest entry still unacked.
+        """
         ...
 
     async def consume(
@@ -65,6 +77,14 @@ class Inbox(Protocol):
 
     async def pending_count(self, session_id: SessionId) -> int:
         """Number of entries not yet acked (claimed or unclaimed)."""
+        ...
+
+    async def find_pending(self, limit: int) -> tuple[PendingSession, ...]:
+        """Up to ``limit`` indexed sessions with entries not yet acked, oldest first (a read)."""
+        ...
+
+    async def drop_pending(self, session_id: SessionId) -> None:
+        """Remove the session from the pending-input index, whatever its inbox still holds."""
         ...
 
     async def wait_for_entry(self, session_id: SessionId) -> None:
