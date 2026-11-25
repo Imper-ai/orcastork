@@ -9,6 +9,8 @@ under **Changed** with the migration.
 
 ## [Unreleased]
 
+## [0.2.0]
+
 ### Added
 
 - **`orcastork_lite`**, a second package in the same distribution: the scheduling core and the
@@ -72,6 +74,7 @@ Its contents were:
   deployment wires an SDK, plus a loguru-to-OTel log bridge.
 - **Injected `Clock`** throughout, which is what makes the test suite deterministic and fast.
 
-[Unreleased]: https://github.com/Imper-ai/orcastork/compare/0.1.1...HEAD
-[0.1.1]: https://github.com/Imper-ai/orcastork/releases/tag/0.1.1
-[0.1.0]: https://github.com/Imper-ai/orcastork/releases/tag/0.1.0
+[Unreleased]: https://github.com/Imper-ai/orcastork/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/Imper-ai/orcastork/compare/v0.1.1...v0.2.0
+[0.1.1]: https://github.com/Imper-ai/orcastork/releases/tag/v0.1.1
+[0.1.0]: https://github.com/Imper-ai/orcastork/releases/tag/v0.1.0
